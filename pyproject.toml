@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-tracker-mcp"
+version = "0.1.0"
+description = "A small durable, workspace-scoped tracker over MCP stdio"
+requires-python = ">=3.11"
+dependencies = ["mcp>=2.2,<3", "pydantic>=2.13,<3"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+tracker-mcp = "tracker.server:main"
+tracker-seed = "tracker.seed:main"
+
+[tool.setuptools.packages.find]
+include = ["tracker*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
