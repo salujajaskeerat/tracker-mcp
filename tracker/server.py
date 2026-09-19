@@ -8,7 +8,9 @@ from typing import Any, Literal
 from mcp.server import MCPServer
 from pydantic import JsonValue
 
+from .analytics import Analytics
 from .batch import Batch, ReadRequest, ResolveRequest, WriteRequest
+from .importer import Decision, ImportLink, ImportRow, Importer
 from .service import Tracker, TrackerError
 from .workflow import Workflow
 
@@ -19,9 +21,15 @@ Respect each page cursor and truncation flag; partial pages are not total counts
 When the user describes a record by content (a note, company, skill, status) rather than
 its title, use search_records text. To answer questions spanning linked records, use one
 traverse call instead of repeated get_record_context hops. Both are reads, not identity proof.
+For totals, averages, counts, ranges, dates or 'per month/per vendor' questions use aggregate or
+search_records where/order_by; never page and add by hand. Report how many records a total skipped.
+Store amounts as plain numbers (4800000, not "48 LPA") with the unit in a separate field, and dates
+as ISO 8601 strings, so they can be compared and summed later.
 For multiple existing-record writes, prefer batch_resolve_records, prepare_batch_write,
 then commit_batch_write. Each item still needs its own identity evidence and reason.
 Dependent discoveries may require another call; never guess missing IDs to batch.
+To add several records to one collection (a pasted list, a CSV, many candidates at once) use
+prepare_import then commit_import; decide each flagged row honestly, never create_anyway by default.
 Act as a friendly organizer. Discover collections by name AND purpose before proposing
 new collections. Read the full returned catalog and examples, including collections
 not ranked as similar: lexical similarity cannot establish semantic equivalence.
@@ -56,6 +64,8 @@ def build_server(tracker: Tracker) -> MCPServer:
     server = MCPServer("Local generic tracker", instructions=AGENT_INSTRUCTIONS)
     workflow = Workflow(tracker)
     batch = Batch(workflow)
+    importer = Importer(workflow)
+    analytics = Analytics(tracker)
 
     def call(operation: Callable, *args) -> dict[str, Any]:
         try:
@@ -77,8 +87,9 @@ def build_server(tracker: Tracker) -> MCPServer:
         """Read 1–10 mixed searches, contexts, traversals or catalogs in one consistent snapshot.
         Searches accept text (full-text) and may include_context to return full records and
         one-hop links for the page. operation 'traverse' takes the traverse tool's arguments,
-        with max_nodes capped at 100 here. Total search limits plus traverse max_nodes
-        (default 50) plus standalone context/catalog items must be <=100.
+        with max_nodes capped at 100 here; operation 'aggregate' takes the aggregate tool's
+        arguments. Total search limits plus traverse max_nodes (default 50) plus standalone
+        context/catalog/aggregate items must be <=100.
         Each search retains its own next_cursor. Context event_limit defaults to 0 (omitted,
         not absent); set 1–100 for history. Relationship limits apply per direction.
         Ordered results carry item_index; any failure rejects the call. Max response 2 MB.
@@ -110,6 +121,33 @@ def build_server(tracker: Tracker) -> MCPServer:
         Retry the same successful action_id safely, including after server restart.
         On failure no item commits; refresh stale reviews, never blindly substitute versions."""
         return call(batch.commit, action_id)
+
+    @server.tool()
+    def prepare_import(collection_id: str, rows: list[ImportRow], decision_reason: str,
+                       links: list[ImportLink] | None = None, review_ids: list[str] | None = None,
+                       clarification: str | None = None) -> dict[str, Any]:
+        """Prepare creating up to 100 records in ONE existing collection, with optional links, in
+        two calls instead of three per record. No per-title resolution is needed: the server checks
+        every row title against every title and alias in the collection (archives included) and
+        against the other rows, with the same similarity rules as resolve_record.
+        rows: [{key, title, data}] where key is your own unique label for the row.
+        links: [{source, relationship_type, target}]; each endpoint is {"row": key} or
+        {"record_id": id}. Existing record endpoints need resolution tickets in review_ids
+        (clarification applies to those). Returns per-row status clean / possible_duplicate /
+        batch_duplicate with candidates, the keys in needs_decision, a preview and action_id.
+        Nothing is written. Very large collections limit rows per call; the error says how many."""
+        return call(importer.prepare, collection_id, rows, links, review_ids, decision_reason, clarification)
+
+    @server.tool()
+    def commit_import(action_id: str, decisions: dict[str, Decision] | None = None) -> dict[str, Any]:
+        """Commit a prepared import atomically. decisions must cover exactly the keys in
+        needs_decision: {"action": "skip"}, {"action": "use_existing", "record_id": <one of that
+        row's candidates>} (its links attach to the existing record), or {"action":
+        "create_anyway", "clarification": <actual user statement or identity evidence>}. Rows that
+        only resemble each other need no clarification once the others are skipped or reused.
+        Links to skipped rows are dropped and reported. Stale if any name in the collection changed
+        since prepare: prepare again. A committed action_id can be retried safely."""
+        return call(importer.commit, action_id, decisions)
 
     @server.tool()
     def discover_collections(name: str, purpose: str) -> dict[str, Any]:
@@ -161,7 +199,8 @@ def build_server(tracker: Tracker) -> MCPServer:
     @server.tool()
     def commit_write(action_id: str) -> dict[str, Any]:
         """Commit exactly the prepared action after atomic context revalidation. Tickets expire
-        after 15 minutes; any workspace data change requires refreshed review. A successful
+        after 15 minutes; a review goes stale only when something it depends on changes (names in
+        the searched scope, links at its candidates, or the collection catalog). A successful
         action_id is idempotent on retry, including after restart. Returns durable IDs and audit."""
         return call(workflow.commit_write, action_id)
 
@@ -186,16 +225,48 @@ def build_server(tracker: Tracker) -> MCPServer:
     @server.tool()
     def search_records(collection_id: str | None = None, query: str | None = None,
                        filters: dict[str, JsonValue] | None = None, limit: int = 20,
-                       cursor: str | None = None, text: str | None = None) -> dict[str, Any]:
+                       cursor: str | None = None, text: str | None = None,
+                       where: list[dict[str, JsonValue]] | None = None,
+                       linked_to: dict[str, JsonValue] | None = None,
+                       order_by: dict[str, JsonValue] | None = None) -> dict[str, Any]:
         """Search active records. text = full-text search over titles AND every stored data
         value at any depth (not key names): all words must match, case/accent-insensitive,
         as prefixes ('interv' finds 'interview'); best match first with a match_snippet.
         Use text when the user describes something by content rather than exact title.
         query = case-insensitive literal title substring. AND top-level filters use canonical
         JSON equality (null differs from missing; nested values compare in full). All three
-        combine with AND. Return 1–100 bounded previews with an opaque cursor. Zero matches
-        does not establish nonexistence. Reuse the same search parameters with the next cursor."""
-        return call(tracker.search_records, collection_id, query, filters, limit, cursor, text)
+        combine with AND, as do:
+        where = [{field, op, value}] typed conditions. field is a LIST of keys (["offer","ctc"]),
+        op is eq ne gt gte lt lte between in contains exists missing. A condition matches only
+        when the stored type matches the operand type: 38 never matches "38" or "38 LPA".
+        Dates compare correctly when stored as ISO 8601 strings (2026-10-03).
+        linked_to = {record_id, relationship_types?, direction?}: only records linked to that
+        record; direction is from the matched record's side (outgoing = it is the source).
+        order_by = {field, type: "number"|"string", direction?}: sort by a field; records lacking
+        the field or holding another type are EXCLUDED, not sorted last. Not combinable with text.
+        Return 1–100 bounded previews with an opaque cursor. Zero matches does not establish
+        nonexistence. Reuse the same search parameters with the next cursor."""
+        return call(tracker.search_records, collection_id, query, filters, limit, cursor, text,
+                    where, linked_to, order_by)
+
+    @server.tool()
+    def aggregate(collection_id: str | None = None, where: list[dict[str, JsonValue]] | None = None,
+                  filters: dict[str, JsonValue] | None = None, text: str | None = None,
+                  linked_to: dict[str, JsonValue] | None = None,
+                  group_by: dict[str, JsonValue] | None = None,
+                  metrics: list[dict[str, JsonValue]] | None = None, limit: int = 50) -> dict[str, Any]:
+        """Count and total active records on the server instead of paging and adding by hand.
+        Filters are the same as search_records (collection_id, where, filters, text, linked_to).
+        metrics = [{op: count}] or [{op: sum|avg|min|max, field: [keys], type?}]; min/max accept
+        type "string" for ISO dates. group_by = {field: [keys], bucket?: "month"|"year"} or
+        {collection: true} or {linked: {relationship_types?, direction?}} (e.g. spend per vendor).
+        ALWAYS read used, skipped_missing and skipped_non_numeric on each metric before quoting a
+        total: a value stored as "95 LPA" or left blank is skipped, not counted as zero, so say how
+        many records the figure leaves out. With linked grouping a record linked to several
+        records counts in each group, so groups can sum to more than matched. Up to 100 groups,
+        largest first; groups_truncated reports more."""
+        return call(analytics.aggregate, collection_id, where, filters, text, linked_to, group_by,
+                    metrics, limit)
 
     @server.tool()
     def get_record_context(record_id: str, relationship_limit: int = 20, event_limit: int = 10) -> dict[str, Any]:

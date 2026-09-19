@@ -11,10 +11,12 @@ research, and other trackers. The server requires no embedded LLM, API key, or h
 
 - `tracker/`: Server implementation, storage, validation, guarded workflows, and demo seeding.
   - `__init__.py`: Python package marker.
-  - `db.py`: SQLite schema, FTS5 index triggers/backfill, canonical JSON helpers, and transaction connections.
+  - `db.py`: SQLite schema, revision-counter and FTS5 triggers, canonical JSON helpers, and transactions.
   - `service.py`: Domain-neutral record, collection, relationship, search, traversal, and history operations.
   - `workflow.py`: Discovery, identity resolution, review tickets, previews, commits, and decision audits.
   - `batch.py`: Bounded batch reads, resolution, and atomic existing-record writes.
+  - `importer.py`: Guarded bulk creation with server-side duplicate review and per-row decisions.
+  - `analytics.py`: Typed `where` conditions, linked-record filters, sorting helpers, and aggregates.
   - `server.py`: Official MCP SDK tool registration, agent instructions, and stdio entry point.
   - `seed.py`: Explicit hiring example that refuses an existing database path.
 - `tests/`: Pytest coverage for storage, workflow safeguards, batches, and real MCP subprocesses.
@@ -47,6 +49,8 @@ uv run pytest -q tests/test_tracker.py
 uv run pytest -q tests/test_workflow.py
 uv run pytest -q tests/test_batch.py
 uv run pytest -q tests/test_search.py
+uv run pytest -q tests/test_import.py
+uv run pytest -q tests/test_analytics.py
 ```
 
 Run storage and workflow tests without MCP subprocess tests:
@@ -183,9 +187,13 @@ The write sequence is:
 4. Commit after revalidating the workspace snapshot and applicable record versions.
 5. Store mutation events, decision evidence, and the committed result atomically.
 
-Tickets are scoped to workspace and actor and expire after 15 minutes. A fingerprint covers
-collections, records, relationships, and aliases. Any change to those workspace entities invalidates
-outstanding reviews, even when the change is unrelated to the intended write.
+Tickets are scoped to workspace and actor and expire after 15 minutes. Each stores the revision
+counters its answer depends on: `names:<collection>` or `names:*` (records created, renamed, archived,
+re-aliased), `links:<record>` for its candidates and context records, or `catalog` for discoveries.
+Triggers in `db.py` bump the counters inside the writing transaction. Unrelated writes leave reviews
+valid; plain data updates bump nothing and are guarded by `expected_version`. Action tickets depend
+on nothing themselves: commit re-validates every review they cite. When adding a write path that can
+change who a name refers to, make sure a trigger bumps the right counter.
 
 Successful action IDs replay their stored results without repeating mutations, including after
 restart or ticket expiry. Replay returns the original result; retrieve context for current state.
@@ -201,7 +209,7 @@ write transaction.
 Full-text search uses an FTS5 table over titles and JSON values. Triggers on `records` maintain it
 inside the writing transaction, so service code never updates the index directly and rollbacks stay
 exact. `record_search_keys` gives each record a stable integer rowid because implicit rowids can change
-on `VACUUM`. The index is derived data: it is excluded from review fingerprints and can be rebuilt.
+on `VACUUM`. The index is derived data: it never affects review freshness and can be rebuilt.
 `traverse` is a bounded breadth-first read using one query per level and direction.
 
 Schema initialization adds missing tables and indexes and backfills the full-text index once. It does not supply a general migration
@@ -217,6 +225,8 @@ Use pytest and temporary SQLite databases. Tests must not depend on the user’s
   stale and expired reviews, concurrency, migration, rollback, and idempotent replay.
 - `tests/test_search.py` covers full-text indexing, ranking, pagination, backfill, rollback safety,
   the no-FTS5 fallback, and multi-hop traversal filters, cycles, limits, and scope.
+- `tests/test_import.py` covers bulk import review, decisions, links, atomicity, staleness, and bounds.
+- `tests/test_analytics.py` covers typed conditions, sorting, aggregates, grouping, and skip accounting.
 - `tests/test_batch.py` covers batch bounds, retrieval parity, pagination, per-item clarification,
   sequential versions, atomic rollback, audit evidence, scope, and MCP restart replay.
 - `examples/walkthrough.py` exercises a scripted hiring workflow through the official MCP client.
@@ -317,8 +327,10 @@ and identity are already clear. Never fabricate clarification or learn aliases f
 Prefer batching when the needed IDs and evidence are available. Preserve these limits:
 
 - Batches: 1–10 items.
-- Batch read budget: search page limits plus traverse `max_nodes` plus standalone context/catalog
-  items must be ≤100.
+- Batch read budget: search page limits plus traverse `max_nodes` plus standalone
+  context/catalog/aggregate items must be ≤100.
+- Imports: 1–100 rows, 0–200 links, 1 MB of row data, and rows × existing names ≤ 1,000,000.
+- Analytics: 20 `where` conditions, 8 keys per field path, 50 `in` values, 10 metrics, 100 groups.
 - Batch response size: at most 2,000,000 canonical JSON bytes.
 - Search and history pages: 1–100 items.
 - Full-text search: 300 characters; the first 16 words are used; all must match as prefixes.
@@ -346,6 +358,8 @@ The code has explicit extension points, but no dynamic plugin registry:
 - Add typed MCP tools in `build_server()` in `tracker/server.py`.
 - Add generic storage behavior to `Tracker` in `tracker/service.py`.
 - Add guarded operations through workflow validation, execution, and decision auditing together.
+- Give new review tickets the narrowest `depends_on` counters that still cover what could change
+  their answer, and add a trigger if a new table can affect identity.
 - Extend batch request models and dispatch in `tracker/batch.py`, preserving bounded atomic behavior.
 - Extend schema initialization in `tracker/db.py` with compatibility coverage for existing data.
 - Keep domain-specific fixtures in `tracker/seed.py` or examples.
@@ -382,6 +396,8 @@ Console entry points are declared in `pyproject.toml`:
 - [Benchmark](examples/batch_benchmark.py): Local transport and batch comparison.
 - [Workflow tests](tests/test_workflow.py): Resolution and write-safety scenarios.
 - [Batch tests](tests/test_batch.py): Atomicity, retrieval, and MCP integration coverage.
+- [Import implementation](tracker/importer.py) and [tests](tests/test_import.py): Guarded bulk creation.
+- [Analytics implementation](tracker/analytics.py) and [tests](tests/test_analytics.py): Conditions and aggregates.
 - [Search tests](tests/test_search.py): Full-text search and traversal coverage.
 
 > TODO: No `docs/ARCH.md`, ADR directory, or separate contributor guide is present.

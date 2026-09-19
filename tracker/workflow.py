@@ -5,7 +5,6 @@ attestation, not something this local server can independently authenticate.
 """
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
-import hashlib
 import json
 import re
 import unicodedata
@@ -36,21 +35,27 @@ def similarity(query, name):
     return SequenceMatcher(None, a, b, autojunk=False).ratio()
 
 
-def candidate_score(query, name):
-    """similarity(), or 0 below the candidate threshold. difflib's two upper bounds reject most
-    names before the quadratic comparison, without changing any score that reaches the threshold."""
-    a, b = normalize(query), normalize(name)
+def score_normalized(a, b):
+    """similarity() on already-normalized strings, or 0 below the candidate threshold. Two upper
+    bounds (length, then shared characters) reject most names before the quadratic comparison,
+    without changing any score that reaches the threshold."""
     if a == b:
         return 1.0
     if min(len(a), len(b)) < 3:
         return 0.0
     if a in b or b in a:
         return 0.85
+    if 2 * min(len(a), len(b)) < CANDIDATE_THRESHOLD * (len(a) + len(b)):
+        return 0.0
     matcher = SequenceMatcher(None, a, b, autojunk=False)
-    if matcher.real_quick_ratio() < CANDIDATE_THRESHOLD or matcher.quick_ratio() < CANDIDATE_THRESHOLD:
+    if matcher.quick_ratio() < CANDIDATE_THRESHOLD:
         return 0.0
     ratio = matcher.ratio()
     return ratio if ratio >= CANDIDATE_THRESHOLD else 0.0
+
+
+def candidate_score(query, name):
+    return score_normalized(normalize(query), normalize(name))
 
 
 def words(value):
@@ -62,36 +67,41 @@ class Workflow:
     def __init__(self, tracker):
         self.t = tracker
 
-    def _fingerprint(self, con):
-        """Conservative workspace-wide snapshot; streams rows without loading all data.
+    def _revisions(self, con, keys):
+        """Current counters for the things a review depends on (see REVISION_SCHEMA); 0 if never bumped."""
+        current = dict.fromkeys(keys, 0)
+        for start in range(0, len(keys), 500):
+            chunk = keys[start:start + 500]
+            current.update(con.execute(f"""SELECT key, rev FROM revisions WHERE workspace_id=?
+                AND key IN ({", ".join("?" * len(chunk))})""", [self.t.workspace, *chunk]).fetchall())
+        return current
 
-        Includes graph, metadata and aliases, not tickets. Unrelated writes may
-        invalidate a ticket; this is intentional for a small local demo.
+    def _save(self, con, kind, payload, depends_on=()):
+        """Persist a ticket with a snapshot of only the counters that could change its answer.
+
+        Unrelated writes elsewhere in the workspace leave it valid. Action tickets depend on
+        nothing themselves: commit re-validates every review they cite, plus record versions.
         """
-        digest = hashlib.sha256()
-        for table in ("collections", "records", "relationships", "record_aliases", "collection_aliases"):
-            digest.update(table.encode())
-            for row in con.execute(f"SELECT * FROM {table} WHERE workspace_id=? ORDER BY rowid",
-                                   (self.t.workspace,)):
-                digest.update(canonical(dict(row)).encode())
-        return digest.hexdigest()
-
-    def _save(self, con, kind, payload, fingerprint=None):
         ticket_id = uid()
         expires = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(timespec="microseconds")
         con.execute("INSERT INTO workflow_tickets VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
                     (ticket_id, self.t.workspace, self.t.actor, kind, canonical(payload),
-                     fingerprint if fingerprint is not None else self._fingerprint(con), expires))
+                     canonical(self._revisions(con, sorted(set(depends_on)))), expires))
         return ticket_id
 
-    def _load(self, con, ticket_id, kind, replay=False, fingerprint=None):
+    def _load(self, con, ticket_id, kind, replay=False):
         row = con.execute("""SELECT * FROM workflow_tickets WHERE id=? AND workspace_id=?
             AND actor_id=? AND kind=?""", (ticket_id, self.t.workspace, self.t.actor, kind)).fetchone()
         if not row:
             raise TrackerError("NOT_FOUND", "Review ticket not found for this workspace and actor")
         if replay and row["result_json"] is not None:
             return json.loads(row["payload_json"]), json.loads(row["result_json"])
-        if row["expires_at"] < now() or row["fingerprint"] != (fingerprint if fingerprint is not None else self._fingerprint(con)):
+        try:
+            reviewed = json.loads(row["fingerprint"])
+        except ValueError:
+            reviewed = None  # ticket issued before revision counters existed
+        if (row["expires_at"] < now() or not isinstance(reviewed, dict)
+                or reviewed != self._revisions(con, list(reviewed))):
             raise TrackerError("STALE_REVIEW", "Context changed or review expired; discover/resolve again")
         return json.loads(row["payload_json"]), None
 
@@ -128,10 +138,10 @@ class Workflow:
                                      for c in candidates], "complete": complete,
                       "status": "needs_review" if complete else "incomplete",
                       "guidance": "Review the entire catalog by purpose, including examples. Similarity is not semantic identity. Reuse a fitting collection; ask only if the distinction is unclear."}
-            result["discovery_id"] = self._save(con, "discovery", result)
+            result["discovery_id"] = self._save(con, "discovery", result, ["catalog"])
             return result
 
-    def resolve_record(self, query, collection_id=None, context_record_ids=None, *, _snapshot=None):
+    def resolve_record(self, query, collection_id=None, context_record_ids=None):
         query = text(query, "query")
         context_record_ids = context_record_ids or []
         if not isinstance(context_record_ids, list) or len(context_record_ids) > 10:
@@ -157,7 +167,7 @@ class Workflow:
             else:
                 names = f"""SELECT record_id, max(score) AS score FROM (
                         SELECT r.id AS record_id, name_score(?, r.title) AS score FROM
-                            (SELECT * FROM records r WHERE {scope} ORDER BY r.id LIMIT ?) r
+                            (SELECT * FROM records r WHERE {scope} LIMIT ?) r
                         UNION ALL
                         SELECT a.record_id, name_score(?, a.alias) FROM record_aliases a
                             WHERE a.workspace_id=? AND a.alias NOT LIKE '@self:%'
@@ -207,12 +217,16 @@ class Workflow:
                       "candidates": candidates[:CANDIDATE_LIMIT], "complete": complete, "status": status,
                       "selected_record_id": exact[0]["id"] if status == "resolved" else None,
                       "guidance": "Names are not unique. Fuzzy/ambiguous candidates require a focused question or independent identity evidence. No match is not proof of absence. Never infer links from recency."}
-            result["resolution_id"] = self._save(con, "resolution", result, fingerprint=_snapshot)
+            # Stale if names in scope change (a new or renamed record could be a better match) or
+            # links change at a candidate or context record (the evidence shown would differ).
+            result["resolution_id"] = self._save(con, "resolution", result, [
+                f"names:{collection_id or '*'}",
+                *(f"links:{rid}" for rid in [*context_record_ids, *(c["id"] for c in result["candidates"])])])
             return result
 
-    def _selection(self, con, record_id, reviews, clarification, fingerprint=None):
+    def _selection(self, con, record_id, reviews, clarification):
         for review_id in reviews:
-            result, _ = self._load(con, review_id, "resolution", fingerprint=fingerprint)
+            result, _ = self._load(con, review_id, "resolution")
             if not result["complete"]:
                 continue
             if record_id in {c["id"] for c in result["candidates"]}:
@@ -246,7 +260,7 @@ class Workflow:
             return {"action_id": action_id, "operation": operation, "arguments": arguments,
                     "preview": result, "note": "Preview only. IDs/timestamps for new objects are provisional. Commit action_id without changing arguments. No extra user approval is needed when intent and identity are already clear."}
 
-    def _validate(self, con, operation, args, reviews, clarification, fingerprint=None):
+    def _validate(self, con, operation, args, reviews, clarification):
         fields = {
             "create_collection": ({"name", "purpose", "record_meaning", "typical_fields", "relationship_guidance"}, set()),
             "update_collection": ({"collection_id", "name", "purpose", "record_meaning", "typical_fields", "relationship_guidance"}, set()),
@@ -273,7 +287,7 @@ class Workflow:
             discovery = None
             for review in reviews:
                 # Collection operations consume discovery tickets only.
-                candidate, _ = self._load(con, review, "discovery", fingerprint=fingerprint)
+                candidate, _ = self._load(con, review, "discovery")
                 if candidate["complete"]:
                     discovery = candidate
                     break
@@ -300,7 +314,7 @@ class Workflow:
             self.t._collection(con, args["collection_id"])
             matches = []
             for review in reviews:
-                candidate, _ = self._load(con, review, "resolution", fingerprint=fingerprint)
+                candidate, _ = self._load(con, review, "resolution")
                 if candidate["collection_id"] == args["collection_id"] and normalize(candidate["query"]) == normalize(args["title"]) and not candidate["context_record_ids"]:
                     matches.append(candidate)
             if not matches or not any(r["complete"] for r in matches):
@@ -317,7 +331,7 @@ class Workflow:
                 raise TrackerError("NOT_FOUND", "Relationship not found")
             ids = [link["source_id"], link["target_id"]]
         for rid in ids:
-            self._selection(con, rid, reviews, clarification, fingerprint=fingerprint)
+            self._selection(con, rid, reviews, clarification)
         if operation in {"add_record_alias", "remove_record_alias", "set_self"} and not clarification:
             raise TrackerError("NEEDS_CLARIFICATION", "Aliases and self mappings require an explicit user statement")
 

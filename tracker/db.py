@@ -64,6 +64,62 @@ CREATE INDEX IF NOT EXISTS relationship_target ON relationships(workspace_id, ta
 CREATE INDEX IF NOT EXISTS event_history ON events(workspace_id, record_id, created_at, id);
 """
 
+# Revision counters let a review ticket go stale only when something it depends on changes:
+#   names:<collection_id> and names:*  record created, renamed, (un)archived or re-aliased
+#   links:<record_id>                  a relationship added or removed at that record
+#   catalog                            any collection or collection alias change
+# Triggers maintain them inside the writing transaction, so rolled-back previews bump nothing
+# and no write path can forget. Plain data updates bump nothing: they cannot change identity.
+def _bump(workspace, key):
+    return f"""INSERT INTO revisions VALUES ({workspace}, {key}, 1)
+        ON CONFLICT(workspace_id, key) DO UPDATE SET rev=rev+1;"""
+
+
+def _bump_names(workspace, collection):
+    return _bump(workspace, f"'names:' || {collection}") + _bump(workspace, "'names:*'")
+
+
+_ALIAS_COLLECTION = "(SELECT collection_id FROM records WHERE id={row}.record_id)"
+REVISION_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS revisions (
+    workspace_id TEXT NOT NULL, key TEXT NOT NULL, rev INTEGER NOT NULL,
+    PRIMARY KEY(workspace_id, key)
+);
+CREATE TRIGGER IF NOT EXISTS revision_record_insert AFTER INSERT ON records BEGIN
+    {_bump_names("new.workspace_id", "new.collection_id")}
+END;
+CREATE TRIGGER IF NOT EXISTS revision_record_identity AFTER UPDATE OF title, archived_at ON records
+WHEN old.title IS NOT new.title OR old.archived_at IS NOT new.archived_at BEGIN
+    {_bump_names("new.workspace_id", "new.collection_id")}
+END;
+CREATE TRIGGER IF NOT EXISTS revision_alias_insert AFTER INSERT ON record_aliases BEGIN
+    {_bump_names("new.workspace_id", _ALIAS_COLLECTION.format(row="new"))}
+END;
+CREATE TRIGGER IF NOT EXISTS revision_alias_delete AFTER DELETE ON record_aliases BEGIN
+    {_bump_names("old.workspace_id", _ALIAS_COLLECTION.format(row="old"))}
+END;
+CREATE TRIGGER IF NOT EXISTS revision_link_insert AFTER INSERT ON relationships BEGIN
+    {_bump("new.workspace_id", "'links:' || new.source_id")}
+    {_bump("new.workspace_id", "'links:' || new.target_id")}
+END;
+CREATE TRIGGER IF NOT EXISTS revision_link_delete AFTER DELETE ON relationships BEGIN
+    {_bump("old.workspace_id", "'links:' || old.source_id")}
+    {_bump("old.workspace_id", "'links:' || old.target_id")}
+END;
+CREATE TRIGGER IF NOT EXISTS revision_collection_insert AFTER INSERT ON collections BEGIN
+    {_bump("new.workspace_id", "'catalog'")}
+END;
+CREATE TRIGGER IF NOT EXISTS revision_collection_update AFTER UPDATE ON collections BEGIN
+    {_bump("new.workspace_id", "'catalog'")}
+END;
+CREATE TRIGGER IF NOT EXISTS revision_collection_alias_insert AFTER INSERT ON collection_aliases BEGIN
+    {_bump("new.workspace_id", "'catalog'")}
+END;
+CREATE TRIGGER IF NOT EXISTS revision_collection_alias_delete AFTER DELETE ON collection_aliases BEGIN
+    {_bump("old.workspace_id", "'catalog'")}
+END;
+"""
+
 # Full-text index over titles and every JSON value (keys are not indexed). Triggers keep it
 # in step with records inside the same transaction, so rollbacks and previews stay exact.
 # record_search_keys supplies a stable integer rowid: records.rowid may change on VACUUM.
@@ -121,7 +177,7 @@ class Database:
         self._connection = ContextVar("tracker_connection", default=None)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as con:
-            con.executescript(SCHEMA)
+            con.executescript(SCHEMA + REVISION_SCHEMA)
             try:
                 con.executescript(FTS_SCHEMA + "BEGIN IMMEDIATE;" + FTS_BACKFILL + "COMMIT;")
                 self.fts = True

@@ -84,11 +84,11 @@ def cursor_scope(*parts):
     return hashlib.sha256(canonical(parts).encode()).hexdigest()
 
 
-def decode_cursor(cursor, scope):
+def decode_cursor(cursor, scope, maximum=1024):
     if cursor is None:
         return None
     try:
-        if not isinstance(cursor, str) or len(cursor) > 1024:
+        if not isinstance(cursor, str) or len(cursor) > maximum:
             raise ValueError
         payload = json.loads(base64.b64decode(cursor, altchars=b"-_", validate=True))
         if (not isinstance(payload, list) or len(payload) != 3 or payload[0] != scope
@@ -213,7 +213,19 @@ class Tracker:
             return result
 
     def search_records(self, collection_id=None, query=None, filters=None, limit=20, cursor=None,
-                       text=None):
+                       text=None, where=None, linked_to=None, order_by=None):
+        """Page through active records; every supplied filter combines with AND.
+
+        where adds typed field conditions and linked_to requires a relationship to one record
+        (see tracker.analytics.compile_where and compile_linked_to). order_by is
+        {"field": [keys...], "type": "number"|"string", "direction": "asc"|"desc"}: results sort
+        by that JSON value, then id. A sorted search returns only records whose field holds that
+        type; records lacking the field or holding another type are excluded, not sorted last.
+        ISO 8601 date strings sort correctly as strings. order_by cannot be combined with text.
+        """
+        # Imported here because analytics builds on this module.
+        from .analytics import (compile_linked_to, compile_where, parse_linked_to, parse_order_by,
+                                sort_position)
         bounded(limit, "limit")
         if query is not None and (not isinstance(query, str) or len(query) > 300):
             invalid("query must be a string of at most 300 characters")
@@ -221,19 +233,28 @@ class Tracker:
         match = None if text is None else fts_query(text)
         if match is not None and not self.db.fts:
             raise TrackerError("UNSUPPORTED", "This SQLite build lacks FTS5; use query and filters instead")
-        # Without text the cursor scope is unchanged, so cursors issued before this feature still work.
+        conditions, condition_args = compile_where(where)
+        parse_linked_to(linked_to)  # shape errors before the cursor and database are touched
+        sort = parse_order_by(order_by)
+        if sort and match is not None:
+            invalid("order_by cannot be combined with text: text search is ordered by relevance")
+        # Optional parts join the cursor scope only when supplied, so cursors issued before each
+        # feature existed still work.
+        extras = {k: v for k, v in (("where", where), ("linked_to", linked_to), ("order_by", order_by))
+                  if v is not None}
         scope = cursor_scope("search", self.workspace, collection_id, query, json.loads(encoded),
-                             *([] if text is None else [text]))
-        position = decode_cursor(cursor, scope)
+                             *([] if text is None else [text]), *([extras] if extras else []))
+        # A sorted search carries the last sort value in its cursor, which can be a long string.
+        position = decode_cursor(cursor, scope, 4 * MAX_DATA_BYTES if sort else 1024)
         # Text search ranks best match first (bm25: lower is better); otherwise oldest first.
-        source, order = "records r", "r.created_at"
-        where, args = ["r.workspace_id=?", "r.archived_at IS NULL"], [self.workspace]
+        source, order, extra, key = "records r", "r.created_at", "", "created_at"
+        clauses, args = ["r.workspace_id=?", "r.archived_at IS NULL"], [self.workspace]
         if match is not None:
             source = """(SELECT rowid AS doc_id, bm25(record_fts, 4.0, 1.0) AS score,
                     snippet(record_fts, -1, '[', ']', ' … ', 12) AS match_snippet
                     FROM record_fts WHERE record_fts MATCH ?) h
                 JOIN record_search_keys k ON k.doc_id=h.doc_id JOIN records r ON r.id=k.record_id"""
-            order = "h.score"
+            order, extra, key = "h.score", ", h.score, h.match_snippet", "score"
             args.insert(0, match)
             if position:
                 try:
@@ -241,29 +262,48 @@ class Tracker:
                 except ValueError:
                     invalid("Invalid cursor or cursor used with a different search/workspace")
         if collection_id is not None:
-            where.append("r.collection_id=?")
+            clauses.append("r.collection_id=?")
             args.append(collection_id)
         if query is not None:
-            where.append("instr(casefold(r.title), ?) > 0")
+            clauses.append("instr(casefold(r.title), ?) > 0")
             args.append(query.casefold())
-        where.append("matches(r.data_json, ?)")
+        clauses.append("matches(r.data_json, ?)")
         args.append(encoded)
-        if position:
-            where.append(f"({order}, r.id) > (?, ?)")
-            args.extend(position)
+        clauses.extend(conditions)
+        args.extend(condition_args)
+        compare, direction = ">", ""
+        if sort:
+            path, kind, descending = sort
+            order, key = "json_extract(r.data_json, ?)", "sort_value"
+            extra = ", json_extract(r.data_json, ?) AS sort_value"
+            args.insert(0, path)  # the select list precedes every other placeholder
+            clauses.append("json_type(r.data_json, ?) "
+                           + ("IN ('integer', 'real')" if kind == "number" else "= 'text'"))
+            args.append(path)
+            position = sort_position(position, kind)
+            if descending:
+                compare, direction = "<", " DESC"
         with self.db.connect() as con:
             if collection_id is not None:
                 self._collection(con, collection_id)
-            rows = con.execute(f"""SELECT r.*, c.name AS collection_name
-                {", h.score, h.match_snippet" if match is not None else ""} FROM {source}
-                JOIN collections c ON c.id=r.collection_id WHERE """ + " AND ".join(where)
-                + f" ORDER BY {order}, r.id LIMIT ?", [*args, limit + 1]).fetchall()
+            link_sql, link_args = compile_linked_to(self, con, linked_to)
+            if link_sql:
+                clauses.append(link_sql)
+                args.extend(link_args)
+            if position:
+                clauses.append(f"({order}, r.id) {compare} (?, ?)")
+                args.extend([path, *position] if sort else position)
+            rows = con.execute(f"""SELECT r.*, c.name AS collection_name{extra} FROM {source}
+                JOIN collections c ON c.id=r.collection_id WHERE """ + " AND ".join(clauses)
+                + f" ORDER BY {'sort_value' if sort else order}{direction}, r.id{direction} LIMIT ?",
+                [*args, limit + 1]).fetchall()
             records = [summary(r) for r in rows[:limit]]
-            if match is not None:
-                for item, row in zip(records, rows):
+            for item, row in zip(records, rows):
+                if match is not None:
                     item["match_snippet"] = row["match_snippet"]
-            return {"records": records,
-                    "next_cursor": next_cursor(rows, limit, scope, "created_at" if match is None else "score"),
+                if sort:
+                    item["sort_value"] = row["sort_value"]
+            return {"records": records, "next_cursor": next_cursor(rows, limit, scope, key),
                     "note": "No matches is not proof an entity does not exist; check spelling, scope, and archives."}
 
     def _change(self, record_id, expected_version, changes=None, archive=False):

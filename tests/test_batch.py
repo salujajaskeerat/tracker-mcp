@@ -135,20 +135,10 @@ def test_sequential_versions_and_link_reviews(setup):
     assert b.commit(b.prepare([items[0], link])['action_id'])['atomic']
 
 
-def test_shared_fingerprint_and_response_rollback(setup, monkeypatch):
+def test_oversized_responses_roll_back(setup, monkeypatch):
     import tracker.batch as module
     t, b, records = setup
-    count = 0
-    original = b.w._fingerprint
-    def counted(con):
-        nonlocal count
-        count += 1
-        return original(con)
-    monkeypatch.setattr(b.w, '_fingerprint', counted)
-    items = actions(b, records)
-    assert count == 1
-    prepared = b.prepare(items)
-    assert count == 2
+    prepared = b.prepare(actions(b, records))
     monkeypatch.setattr(module, 'MAX_RESPONSE_BYTES', 1)
     failure('RESPONSE_TOO_LARGE', b.commit, prepared['action_id'])
     assert all(t.get_record_context(r['id'])['record'] == r for r in records)

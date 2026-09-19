@@ -200,11 +200,14 @@ SDK schema validation before a handler uses MCP `is_error=true` instead.
 | `list_collections()` | Names, IDs, descriptions and active counts (max 1000; truncation flag) |
 | `discover_collections(name, purpose)` | Full bounded catalog, examples, saved aliases, lexical suggestions and `discovery_id` |
 | `resolve_record(query, collection_id?, context_record_ids?)` | Candidates including archives, reasons, linked summaries, status and `resolution_id` |
-| `search_records(collection_id?, query?, filters?, limit=20, cursor?, text?)` | Full-text (`text`), literal-title (`query`) and exact-filter search of active records; paginated previews |
+| `search_records(collection_id?, query?, filters?, limit=20, cursor?, text?, where?, linked_to?, order_by?)` | Full-text (`text`), literal-title (`query`), exact-filter, typed-condition (`where`), linked-record and sorted search of active records; paginated previews |
 | `traverse(start_record_id, max_depth=2, direction="both", relationship_types?, collection_id?, max_nodes=50)` | Multi-hop walk over explicit links: reached records with depth and shortest path, plus walked relationships |
 | `get_record_context(record_id, relationship_limit=20, event_limit=10)` | Full record/version, one-hop links, recent audit events |
 | `prepare_write(operation, arguments, review_ids, decision_reason, clarification?)` | Validate the exact proposed write; return a preview and `action_id` without changing entities |
 | `commit_write(action_id)` | Atomically recheck context, apply exactly that action, and audit it |
+| `prepare_import(collection_id, rows, decision_reason, links?, review_ids?, clarification?)` | Review up to 100 new records for duplicates on the server and preview them, with links; returns rows needing a decision |
+| `commit_import(action_id, decisions?)` | Atomically create the reviewed rows, applying a skip / use_existing / create_anyway decision to each flagged row |
+| `aggregate(collection_id?, where?, filters?, text?, linked_to?, group_by?, metrics?, limit=50)` | Counts, sums, averages, min/max, optionally grouped by field, month/year, collection or linked record, with skipped-record counts |
 | `get_record_history(record_id, limit=20, cursor?)` | Paginated record mutations, link corrections and decision rationale |
 | `get_collection_history(collection_id, limit=20, cursor?)` | Paginated collection creation, edits, aliases, reuse and decision rationale |
 
@@ -313,14 +316,25 @@ rationale, never authenticated user consent. Scores and recency are not identity
 ### Freshness, atomicity and retries
 
 Reviews and prepared actions persist in SQLite, are workspace/actor scoped, and expire
-in 15 minutes. A fingerprint covers the workspace's collections, records, relationships
-and aliases. Any change invalidates outstanding reviews—even an unrelated change.
-This conservative policy is simple to explain and avoids stale graph/duplicate checks;
-a larger system would use narrower dependency tracking.
+in 15 minutes. A review also goes stale when something it depends on changes, and only then.
+Each ticket stores the revision counters that could change its answer:
+
+| Counter | Bumped by | Checked by |
+| --- | --- | --- |
+| `names:<collection>` and `names:*` | a record created, renamed, archived or re-aliased | resolutions in that collection, or workspace-wide ones; prepared imports |
+| `links:<record>` | a relationship added or removed at that record | resolutions that returned it as a candidate or used it as context |
+| `catalog` | any collection or collection-alias change | collection discoveries |
+
+Plain data updates bump nothing: they cannot change which record a name refers to, and
+`expected_version` already rejects a stale edit of the record itself. So a write in another
+collection, or another agent working elsewhere, no longer invalidates your review, while a new
+namesake in the collection you searched still does. Triggers maintain the counters inside the
+writing transaction, so previews bump nothing and no write path can skip them. Validating a
+ticket reads a few rows; it no longer hashes the workspace.
 
 Preparation validates the actual mutation inside a rollback-only savepoint. It leaves
 no entity, relationship or mutation event behind. IDs/timestamps of new objects in the
-preview are provisional: use those returned by commit. Commit rechecks the fingerprint,
+preview are provisional: use those returned by commit. Commit rechecks every cited review,
 versions and evidence in the same write transaction as the mutation and audit events.
 Concurrent creation attempts cannot both commit from the same reviewed snapshot.
 
@@ -379,6 +393,35 @@ If the local SQLite build lacks FTS5, `text` returns `UNSUPPORTED` and everythin
   and flagged by `archived_at`. Cycles are safe: a record is never visited twice.
 
 Both tools are reads. They do not issue review tickets, so resolve records before writing.
+
+### Conditions, sorting and totals (`where`, `linked_to`, `order_by`, `aggregate`)
+
+`where` is a list of `{"field": [...], "op": ..., "value": ...}` conditions, ANDed with every
+other search parameter. `field` is a list of keys (`["offer", "ctc"]`) because keys may contain
+dots. Operators: `eq ne gt gte lt lte between in contains exists missing`.
+
+- Comparison is typed. A condition matches only when the stored JSON type matches the operand:
+  `38` never matches `"38"` or `"38 LPA"`, and `true` is not `1`. `ne` means the field exists
+  with a compatible type and differs. `exists` is true for JSON null; `missing` means absent.
+- There is no date type. ISO 8601 strings (`2026-10-03`) compare and sort correctly as strings.
+- `linked_to = {"record_id", "relationship_types"?, "direction"?}` keeps only records linked to
+  that record. Direction is from the matched record's side: `outgoing` means it is the source.
+- `order_by = {"field", "type": "number"|"string", "direction"?}` sorts with stable cursors.
+  Records lacking the field or holding another type are excluded, not sorted last. It cannot be
+  combined with `text`, which is ordered by relevance.
+
+`aggregate` computes `count`, `sum`, `avg`, `min` and `max` on the server with the same filters.
+`group_by` is `{"field": [...], "bucket"?: "month"|"year"}`, `{"collection": true}` or
+`{"linked": {"relationship_types"?, "direction"?}}`, for example spend per vendor.
+
+Totals are honest about what they leave out. Every non-count metric reports `used`,
+`skipped_missing` and `skipped_non_numeric`, and these add up to the group's `count`. A salary
+stored as `"95 LPA"` is skipped, not treated as zero, and the agent is instructed to say so.
+Store amounts as plain numbers with the unit in another field. With linked grouping a record
+linked to several records counts in each of those groups, so groups can exceed `matched`.
+Field paths and values are always bound parameters; key names containing a double quote,
+backslash or control character are rejected. These are full scans over JSON, fine for tens of
+thousands of records.
 
 ### Title and filter search
 
@@ -497,6 +540,37 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+## Importing many records at once
+
+Creating one record costs three calls because the agent must hold a duplicate review for its
+title. For a pasted list or CSV that adds round trips but no safety, so `prepare_import` runs
+the review on the server: every row title is scored against every title and alias in the
+target collection (archives included) and against the other rows, with the same rules and
+threshold as `resolve_record`.
+
+```json
+{"collection_id": "PEOPLE_ID", "decision_reason": "Candidate list the user pasted",
+ "rows": [{"key": "a", "title": "Rohan Mehta", "data": {"source": "referral"}},
+          {"key": "b", "title": "Priya Raman", "data": {}}],
+ "links": [{"source": {"row": "a"}, "relationship_type": "applied_to", "target": {"record_id": "OPENING_ID"}}],
+ "review_ids": ["RESOLUTION_OF_THE_OPENING"]}
+```
+
+It returns each row as `clean`, `possible_duplicate` (with up to five candidates) or
+`batch_duplicate`, the keys in `needs_decision`, a preview and an `action_id`. Nothing is written.
+`commit_import(action_id, decisions)` then needs a decision for exactly the flagged rows:
+`skip`, `use_existing` with one of that row's candidates (its links attach to the existing
+record), or `create_anyway` with an actual clarification. Rows that only resemble each other
+need no clarification once the others are skipped or reused. Links touching a skipped row are
+dropped and reported. The commit is atomic, audited per record, replayable by `action_id`,
+and goes stale if any name in the collection changed since prepare.
+
+Limits: 100 rows, 200 links and 1 MB of row data per import, into one existing collection.
+Link endpoints that are existing records need resolution tickets like any other write.
+Rows times existing names is capped at one million comparisons (about three seconds), because
+no index can skip comparisons without risking a missed typo; above that the error states how
+many rows fit per call. Collection creation still uses the single-write discovery workflow.
+
 ## Fewer MCP round trips with batches
 
 The server instructions now prefer these tools for multiple reads or existing-record
@@ -543,7 +617,7 @@ isolation and per-item ambiguity checks still apply.
 
 Batches contain 1–10 items. `batch_read` also accepts `traverse` items (same arguments as
 the tool, `max_nodes` at most 100). Search page limits, traverse `max_nodes` (default 50)
-and standalone context/catalog items share a budget of 100; responses are capped at 2 MB. Split oversized batches and refresh
+and standalone context/catalog/aggregate items share a budget of 100; responses are capped at 2 MB. Split oversized batches and refresh
 reviews after committed writes. Creation and collection changes continue through the
 existing single-write discovery workflow, preserving duplicate checks and collection
 clarity. Dependent steps requiring newly discovered IDs still need another round trip.

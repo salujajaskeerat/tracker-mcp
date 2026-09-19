@@ -216,7 +216,8 @@ def test_mcp_stdio_integration(tmp_path):
                 "list_collections", "create_collection", "search_records", "get_record_context",
                 "create_record", "update_record", "link_records", "unlink_records", "get_record_history", "archive_record",
                 "discover_collections", "resolve_record", "prepare_write", "commit_write", "get_collection_history", "batch_read", "batch_resolve_records",
-                "prepare_batch_write", "commit_batch_write", "traverse"}
+                "prepare_batch_write", "commit_batch_write", "traverse",
+                "prepare_import", "commit_import", "aggregate"}
             async def call(name, arguments):
                 result = await client.call_tool(name, arguments)
                 assert not result.is_error, result
@@ -241,6 +242,24 @@ def test_mcp_stdio_integration(tmp_path):
             walk = (await call("traverse", {"start_record_id": created["id"], "max_depth": 3}))["result"]
             assert walk["start"]["id"] == created["id"] and walk["nodes"] == []
             assert (await call("traverse", {"start_record_id": created["id"], "max_depth": 9}))["error"]["code"] == "INVALID_INPUT"
+            imported = (await call("prepare_import", {"collection_id": collection["id"], "decision_reason": "Receipts",
+                "rows": [{"key": "a", "title": "Taxi", "data": {"amount": 12}}, {"key": "b", "title": "Coffe", "data": {}}],
+                "links": [{"source": {"row": "a"}, "relationship_type": "same_trip", "target": {"row": "b"}}]}))["result"]
+            assert imported["needs_decision"] == ["b"]
+            assert (await call("commit_import", {"action_id": imported["action_id"]}))["error"]["code"] == "NEEDS_CLARIFICATION"
+            done = (await call("commit_import", {"action_id": imported["action_id"], "decisions": {
+                "b": {"action": "use_existing", "record_id": created["id"]}}}))["result"]
+            assert [c["title"] for c in done["created"]] == ["Taxi"] and done["links"][0]["target_id"] == created["id"]
+            total = (await call("aggregate", {"collection_id": collection["id"],
+                "metrics": [{"op": "sum", "field": ["amount"]}]}))["result"]["groups"][0]["metrics"][0]
+            assert (total["value"], total["used"], total["skipped_missing"]) == (17, 2, 0)
+            cheap = (await call("search_records", {"where": [{"field": ["amount"], "op": "lt", "value": 10}],
+                "order_by": {"field": ["amount"], "type": "number"}}))["result"]["records"]
+            assert [r["title"] for r in cheap] == ["Coffee"]
+            mixed = (await call("batch_read", {"requests": [{"operation": "aggregate", "collection_id": collection["id"]},
+                {"operation": "search_records", "where": [{"field": ["amount"], "op": "gte", "value": 10}]}]}))["result"]["results"]
+            assert mixed[0]["result"]["matched"] == 2 and mixed[1]["result"]["records"][0]["title"] == "Taxi"
+            assert (await call("aggregate", {"metrics": [{"op": "median"}]}))["error"]["code"] == "INVALID_INPUT"
             resolution = (await call("resolve_record", {"query": created["id"]}))["result"]
             assert (await call("prepare_write", {"operation": "update_record", "arguments": {
                 "record_id": created["id"], "changes": {}, "expected_version": 9},

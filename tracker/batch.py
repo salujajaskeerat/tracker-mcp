@@ -3,6 +3,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 
+from .analytics import Analytics
 from .db import canonical
 from .service import TrackerError, invalid, object_json
 
@@ -21,6 +22,9 @@ class SearchRead(Input):
     limit: int = Field(default=20, ge=1, le=100)
     cursor: str | None = None
     text: str | None = None
+    where: list[dict[str, JsonValue]] | None = None
+    linked_to: dict[str, JsonValue] | None = None
+    order_by: dict[str, JsonValue] | None = None
     include_context: bool = False
     relationship_limit: int = Field(default=20, ge=1, le=100)
     event_limit: int = Field(default=0, ge=0, le=100)
@@ -47,7 +51,19 @@ class TraverseRead(Input):
     max_nodes: int = Field(default=50, ge=1, le=100)
 
 
-ReadRequest = Annotated[SearchRead | ContextRead | CollectionsRead | TraverseRead,
+class AggregateRead(Input):
+    operation: Literal['aggregate']
+    collection_id: str | None = None
+    where: list[dict[str, JsonValue]] | None = None
+    filters: dict[str, JsonValue] | None = None
+    text: str | None = None
+    linked_to: dict[str, JsonValue] | None = None
+    group_by: dict[str, JsonValue] | None = None
+    metrics: list[dict[str, JsonValue]] | None = None
+    limit: int = Field(default=50, ge=1, le=100)
+
+
+ReadRequest = Annotated[SearchRead | ContextRead | CollectionsRead | TraverseRead | AggregateRead,
                         Field(discriminator='operation')]
 
 
@@ -97,6 +113,7 @@ class Batch:
     def __init__(self, workflow):
         self.w = workflow
         self.t = workflow.t
+        self.a = Analytics(workflow.t)
 
     def read(self, requests):
         requests = parse_items(requests, ReadRequest)
@@ -109,13 +126,16 @@ class Batch:
                     if isinstance(request, SearchRead):
                         result = self.t.search_records(request.collection_id, request.query,
                                                        request.filters, request.limit, request.cursor,
-                                                       request.text)
+                                                       request.text, request.where, request.linked_to,
+                                                       request.order_by)
                         if request.include_context:
                             result['contexts'] = [self.t.get_record_context(
                                 r['id'], request.relationship_limit, request.event_limit)
                                 for r in result['records']]
                     elif isinstance(request, ContextRead):
                         result = self.t.get_record_context(request.record_id, request.relationship_limit, request.event_limit)
+                    elif isinstance(request, AggregateRead):
+                        result = self.a.aggregate(**request.model_dump(exclude={'operation'}))
                     elif isinstance(request, TraverseRead):
                         result = self.t.traverse(request.start_record_id, request.max_depth, request.direction,
                                                  request.relationship_types, request.collection_id, request.max_nodes)
@@ -129,26 +149,25 @@ class Batch:
     def resolve(self, requests):
         requests = parse_items(requests, ResolveRequest)
         with self.t.db.connect(write=True) as con:
-            fingerprint = self.w._fingerprint(con)
             results = []
             for index, request in enumerate(requests):
                 try:
-                    result = self.w.resolve_record(**request.model_dump(), _snapshot=fingerprint)
+                    result = self.w.resolve_record(**request.model_dump())
                     results.append({'item_index': index, 'result': result})
                 except TrackerError as exc:
                     raise item_error(exc, index) from exc
             return bounded_response({'results': results})
 
-    def _validate(self, con, actions, fingerprint):
-        # ALL reviews are checked against the same pre-write snapshot, before any
-        # mutation. Never ignore stale checks merely because earlier items wrote.
+    def _validate(self, con, actions):
+        # ALL reviews are checked before any mutation, so an earlier item's write in this
+        # batch can never make a later item's review look stale, or hide real staleness.
         for index, action in enumerate(actions):
             try:
                 object_json(action.arguments)
                 if not action.decision_reason.strip() or (action.clarification is not None and not action.clarification.strip()):
                     invalid('Decision reason and any clarification must be nonblank')
                 self.w._validate(con, action.operation, action.arguments, action.review_ids,
-                                 action.clarification, fingerprint=fingerprint)
+                                 action.clarification)
             except TrackerError as exc:
                 raise item_error(exc, index) from exc
 
@@ -170,8 +189,7 @@ class Batch:
     def prepare(self, actions):
         actions = parse_items(actions, WriteRequest)
         with self.t.db.connect(write=True) as con:
-            fingerprint = self.w._fingerprint(con)
-            self._validate(con, actions, fingerprint)
+            self._validate(con, actions)
             con.execute('SAVEPOINT batch_preview')
             try:
                 preview = self._perform(con, actions)
@@ -179,18 +197,17 @@ class Batch:
                 con.execute('ROLLBACK TO batch_preview')
                 con.execute('RELEASE batch_preview')
             payload = {'actions': [a.model_dump() for a in actions]}
-            action_id = self.w._save(con, 'batch_action', payload, fingerprint=fingerprint)
+            action_id = self.w._save(con, 'batch_action', payload)
             return {'action_id': action_id, 'preview': preview,
                     'note': 'No mutations committed. Use commit_batch_write. Items run in order; all succeed or all roll back.'}
 
     def commit(self, action_id):
         with self.t.db.connect(write=True) as con:
-            fingerprint = self.w._fingerprint(con)
-            payload, replay = self.w._load(con, action_id, 'batch_action', replay=True, fingerprint=fingerprint)
+            payload, replay = self.w._load(con, action_id, 'batch_action', replay=True)
             if replay is not None:
                 return replay
             actions = parse_items(payload['actions'], WriteRequest)
-            self._validate(con, actions, fingerprint)
+            self._validate(con, actions)
             result = self._perform(con, actions, action_id=action_id)
             con.execute('UPDATE workflow_tickets SET result_json=? WHERE id=?', (canonical(result), action_id))
             return result

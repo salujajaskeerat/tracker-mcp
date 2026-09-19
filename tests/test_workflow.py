@@ -381,3 +381,102 @@ def test_candidate_score_shortcuts_never_change_a_qualifying_score():
         a, b = ("".join(rng.choices("abcde fg", k=rng.randint(1, 9))) for _ in range(2))
         expected = similarity(a, b)
         assert candidate_score(a, b) == (expected if expected >= CANDIDATE_THRESHOLD else 0)
+
+
+def prepared_update(t, w, record, collection_scope=False):
+    review = w.resolve_record(record["title"], record["collection_id"] if collection_scope else None)
+    current = t.get_record_context(record["id"])["record"]["version"]
+    return w.prepare_write("update_record", {"record_id": record["id"], "changes": {"note": "x"},
+                           "expected_version": current}, [review["resolution_id"]], "Requested update")
+
+
+def test_unrelated_writes_do_not_invalidate_reviews(setup):
+    t, w = setup
+    kirat = make_person(t)
+    other = t.create_collection("expenses", "Money spent")
+    action = prepared_update(t, w, kirat, collection_scope=True)
+    coffee = t.create_record(other["id"], "Coffee", {"amount": 5})      # another collection
+    t.update_record(coffee["id"], {"amount": 6}, 1)                     # plain data, elsewhere
+    lunch = t.create_record(other["id"], "Lunch", {})
+    t.link_records(coffee["id"], "same_day", lunch["id"])               # links between other records
+    t.create_collection("projects", "Work")                             # catalog change
+    assert w.commit_write(action["action_id"])["data"] == {"note": "x"}
+    # A plain data update on the reviewed record itself is caught by its version, not by staleness.
+    action = prepared_update(t, w, kirat, collection_scope=True)
+    t.update_record(kirat["id"], {"city": "Pune"}, 2)
+    fails("VERSION_CONFLICT", w.commit_write, action["action_id"])
+
+
+@pytest.mark.parametrize("change", ["create", "rename", "alias", "archive", "link"])
+def test_changes_that_could_alter_identity_invalidate_reviews(setup, change):
+    t, w = setup
+    kirat, other = make_person(t), make_person(t, "Abhishek")
+    action = prepared_update(t, w, kirat, collection_scope=True)
+    if change == "create":
+        t.create_record(kirat["collection_id"], "Kirat", {})  # a namesake now exists
+    elif change == "link":
+        t.link_records(other["id"], "knows", kirat["id"])
+    else:
+        review = w.resolve_record("Abhishek", other["collection_id"])
+        operation, extra = {"rename": ("rename_record", {"title": "Kirat"}),
+                            "alias": ("add_record_alias", {"alias": "Kirat"}),
+                            "archive": ("archive_record", {})}[change]
+        w.commit_write(w.prepare_write(operation, {"record_id": other["id"], "expected_version": 1, **extra},
+                       [review["resolution_id"]], "Requested", "User said so")["action_id"])
+    fails("STALE_REVIEW", w.commit_write, action["action_id"])
+
+
+def test_workspace_wide_and_context_reviews_track_their_own_scope(setup):
+    t, w = setup
+    kirat = make_person(t)
+    expenses = t.create_collection("expenses", "Money spent")
+    wide = prepared_update(t, w, kirat)  # resolved across the whole workspace
+    t.create_record(expenses["id"], "Coffee", {})
+    fails("STALE_REVIEW", w.commit_write, wide["action_id"])  # any new name could have matched
+    opening = t.create_record(expenses["id"], "Opening", {})
+    t.link_records(kirat["id"], "applied", opening["id"])
+    review = w.resolve_record("Kirat", kirat["collection_id"], [opening["id"]])
+    action = w.prepare_write("update_record", {"record_id": kirat["id"], "changes": {}, "expected_version": 1},
+                             [review["resolution_id"]], "Requested")
+    namesake = t.create_record(expenses["id"], "Kirat", {})
+    t.link_records(namesake["id"], "applied", opening["id"])  # changes who is linked to the context record
+    fails("STALE_REVIEW", w.commit_write, action["action_id"])
+
+
+def test_discovery_is_stale_only_after_catalog_changes(setup):
+    t, w = setup
+    person = make_person(t)
+    action = prepare_collection(w, collection_args())
+    t.create_record(person["collection_id"], "Someone", {})  # records do not change the catalog
+    t.link_records(person["id"], "knows", person["id"])
+    assert w.commit_write(action["action_id"])["name"] == "expenses"
+    action = prepare_collection(w, collection_args(name="projects", purpose="Client engagements"))
+    t.create_collection("clients", "Customers")
+    fails("STALE_REVIEW", w.commit_write, action["action_id"])
+
+
+def test_previews_do_not_bump_revisions_and_legacy_tickets_are_stale(setup):
+    t, w = setup
+    kirat = make_person(t)
+    first = prepared_update(t, w, kirat, collection_scope=True)
+    review = w.resolve_record("Kirat", kirat["collection_id"])
+    w.prepare_write("rename_record", {"record_id": kirat["id"], "title": "Kirat S", "expected_version": 1},
+                    [review["resolution_id"]], "Preview only")  # rolled back: must not look like a rename
+    assert w.commit_write(first["action_id"])["version"] == 2
+    second = prepared_update(t, w, kirat, collection_scope=True)
+    with t.db.connect(write=True) as con:  # a ticket saved by the old whole-workspace hash
+        con.execute("UPDATE workflow_tickets SET fingerprint=? WHERE kind='resolution'", ("ab" * 32,))
+    fails("STALE_REVIEW", w.commit_write, second["action_id"])
+
+
+def test_two_actors_in_different_collections_do_not_block_each_other(setup):
+    t, w = setup
+    kirat = make_person(t)
+    expenses = t.create_collection("expenses", "Money spent")
+    coffee = t.create_record(expenses["id"], "Coffee", {})
+    other_tracker = Tracker(t.db, t.workspace, "second-agent")
+    other = Workflow(other_tracker)
+    mine = prepared_update(t, w, kirat, collection_scope=True)
+    theirs = prepared_update(other_tracker, other, coffee, collection_scope=True)
+    assert other.commit_write(theirs["action_id"])["version"] == 2
+    assert w.commit_write(mine["action_id"])["version"] == 2
