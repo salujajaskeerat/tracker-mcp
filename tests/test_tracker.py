@@ -215,7 +215,8 @@ def test_mcp_stdio_integration(tmp_path):
             assert {t.name for t in listed.tools} == {
                 "list_collections", "create_collection", "search_records", "get_record_context",
                 "create_record", "update_record", "link_records", "unlink_records", "get_record_history", "archive_record",
-                "discover_collections", "resolve_record", "prepare_write", "commit_write", "get_collection_history"}
+                "discover_collections", "resolve_record", "prepare_write", "commit_write", "get_collection_history", "batch_read", "batch_resolve_records",
+                "prepare_batch_write", "commit_batch_write"}
             async def call(name, arguments):
                 result = await client.call_tool(name, arguments)
                 assert not result.is_error, result

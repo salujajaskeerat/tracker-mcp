@@ -1,31 +1,109 @@
-# Local tracker MCP: durable information with reviewed writes
+# Anchor MCP
 
-A coding agent interprets your requests; this Python/SQLite server stores generic
-records, explicit relationships and audit history. Hiring is an example, not a
-hard-coded schema. Expenses, projects and customers use the same storage model.
-No embedded LLM, external service, credentials, ORM or background jobs are required.
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![MCP](https://img.shields.io/badge/protocol-MCP-6E56CF)](https://modelcontextprotocol.io/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](#license)
+
+Durable, local memory and structured context for coding agents, powered by Python,
+SQLite, and MCP stdio.
+It stores generic records, explicit relationships, and an audit history so an agent
+can find the right information without silently guessing. Hiring is only an example:
+the same server works for projects, customers, expenses, research notes, and more.
+
+No API key, hosted service, embedded LLM, ORM, or background worker is required.
+
+## Why use it?
+
+Give your coding agent a small, private, durable workspace it can safely update:
+
+- 🧑‍💼 **Hiring tracker:** connect people → applications → interviews → feedback.
+- 🚀 **Project memory:** keep decisions, owners, milestones, and related work together.
+- 💳 **Expense log:** organize spending by category and link it to a project or person.
+- 📚 **Research notebook:** save findings, sources, and follow-up relationships.
+- 🧩 **Customer context:** retain account notes and activity across conversations.
+
+Writes follow `review → prepare → commit`, with version checks and audit events.
+Ambiguous names are surfaced for clarification instead of being guessed.
+
+## Fastest setup
+
+Run these commands from the repository root:
+
+```bash
+python3 --version                 # 3.11 or newer
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+
+export TRACKER_DB_PATH="$PWD/tracker.db"
+export TRACKER_WORKSPACE_ID="local"
+export TRACKER_ACTOR_ID="local-agent"
+
+.venv/bin/python -m tracker.server
+```
+
+The last command starts an MCP **stdio** server. It waits for an MCP client; it is
+not an interactive terminal prompt. Keep it running when testing manually, or let
+your coding agent launch it from the configuration below. Logs go to stderr and
+protocol messages use stdout.
+
+To install the test dependencies too:
+
+```bash
+.venv/bin/python -m pip install -e '.[test]'
+.venv/bin/python -m pytest -q
+```
+
+## Connect a coding agent
+
+The configuration shape below works for MCP clients that support stdio servers,
+including clients such as Claude Desktop, Cursor, Windsurf, and other MCP-enabled
+coding agents. Add it to that client’s MCP configuration, replacing the repository
+path with an absolute path on your machine.
+
+```json
+{
+  "mcpServers": {
+    "anchor": {
+      "command": "/absolute/path/to/Interview_1/.venv/bin/python",
+      "args": ["-m", "tracker.server"],
+      "env": {
+        "TRACKER_DB_PATH": "/absolute/path/to/Interview_1/tracker.db",
+        "TRACKER_WORKSPACE_ID": "local",
+        "TRACKER_ACTOR_ID": "local-agent"
+      }
+    }
+  }
+}
+```
+
+After saving the client configuration, restart or reload the client and ask:
+`List the available tracker collections.` If it responds with an empty catalog,
+the connection is working. The database is created automatically on first launch.
+
+Use an absolute database path in client configuration. Relative paths depend on the
+client’s working directory and can create a second, unexpected database.
+
+### Optional: try the seeded demo
+
+The seed command refuses to overwrite an existing path, so use a new filename:
+
+```bash
+TRACKER_DB_PATH="$PWD/demo.db" .venv/bin/python -m tracker.seed
+TRACKER_DB_PATH="$PWD/demo.db" .venv/bin/python -m tracker.server
+```
+
+Or run the end-to-end scripted walkthrough, which uses an isolated temporary database:
+
+```bash
+.venv/bin/python examples/walkthrough.py
+```
+
+## Configuration
 
 The server now supports spelling suggestions, confirmed aliases, context-based
 record resolution and collection discovery by purpose. **Every MCP write must go
 through review → prepare → commit.** Similar spelling alone cannot authorize a write.
 This reduces selection mistakes; it does not guarantee an agent understands your intent.
-
-## Setup and run
-
-Python 3.11+ and SQLite JSON functions are required (tested with Python 3.12).
-
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -e '.[test]'
-export TRACKER_DB_PATH="$PWD/tracker.db"
-export TRACKER_WORKSPACE_ID="local"
-export TRACKER_ACTOR_ID="local-agent"
-.venv/bin/python -m tracker.server
-```
-
-The server initializes storage automatically, then waits for MCP messages on stdio.
-It is not an interactive terminal prompt. Logs go to stderr; stdout is reserved
-for protocol messages. The installed `tracker-mcp` command is equivalent.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -37,37 +115,6 @@ This is a trusted local demo, not an authenticated multi-user service. Anyone wh
 controls the local process or database can bypass application checks. The seed and
 Python `Tracker` API are internal/admin operations; MCP exposes guarded writes only.
 
-### MCP client configuration
-
-After editable installation, the module works from other working directories.
-Use this common configuration shape, replacing the paths. Client-specific config
-file locations vary. Your client launches the server; no separate server is needed.
-
-```json
-{
-  "mcpServers": {
-    "tracker": {
-      "command": "/absolute/path/Interview_1/.venv/bin/python",
-      "args": ["-m", "tracker.server"],
-      "env": {
-        "TRACKER_DB_PATH": "/absolute/path/Interview_1/tracker.db",
-        "TRACKER_WORKSPACE_ID": "local",
-        "TRACKER_ACTOR_ID": "local-agent"
-      }
-    }
-  }
-}
-```
-
-### Seed and runnable walkthrough
-
-Seed a **new** path before starting its server:
-
-```bash
-TRACKER_DB_PATH="$PWD/demo.db" .venv/bin/python -m tracker.seed
-TRACKER_DB_PATH="$PWD/demo.db" .venv/bin/python -m tracker.server
-```
-
 The seed prints stable IDs and refuses any existing file, including an empty one.
 It creates five clearly described collections: people, openings, applications,
 interviews and feedback. Eleven records cover Kirat and Abhishek; Junior Backend
@@ -76,13 +123,7 @@ two interviews for Kirat's backend application; separate Priya/Rahul feedback on
 its coding interview. A failed seed may leave partial data; inspect it and use a
 new filename for another demo. `tracker-seed` is the equivalent installed command.
 
-Run the actual MCP workflow in an isolated temporary database:
-
-```bash
-.venv/bin/python examples/walkthrough.py
-```
-
-It demonstrates `Kriat` → clarification → Kirat, reuse of Feedback, resolution of
+The walkthrough demonstrates `Kriat` → clarification → Kirat, reuse of Feedback, resolution of
 application and interview, creation/linking of an additional assessment, idempotent
 retry, removal of a deliberately wrong link, and retrieval after server restart.
 This is a scripted agent scenario with prescribed user answers, not an evaluation
@@ -291,7 +332,7 @@ actual interview date must be stored separately when known, never invented.
 - Data, changes and prepared argument objects: 16 KiB canonical UTF-8 JSON; merged
   records also obey the limit. Finite JSON objects with string keys only.
 - Aliases: at most 20 per entity; collection guidance lists 1–20 optional field examples.
-- Search/history/context limits: 1–100. Context links are capped per direction with
+- Search/history/context limits: 1–100; context `event_limit=0` omits history. Links are capped per direction with
   truncation flags; follow IDs explicitly. Relationship paging remains an extension.
 - Discovery scans at most 200 collections and returns up to three sample active records
   per collection. Resolution scans at most 1000 records in the selected collection
@@ -331,14 +372,11 @@ or one necessary clarification before a write. Inspect the resulting histories.
 - `tracker/db.py`: generic schema, additive tables, transactional connections.
 - `tracker/service.py`: storage operations, validation, versions and audit history.
 - `tracker/workflow.py`: lexical discovery, review tickets and guarded transactions.
+- `tracker/batch.py`: bounded grouped retrieval, resolution and atomic existing-record writes.
 - `tracker/server.py`: typed MCP tools, instructions and predictable error envelopes.
 - `tracker/seed.py`: domain-specific example data only.
 - `examples/walkthrough.py`: runnable real-stdio hiring scenario.
 - `tests/`: storage, workflow and MCP integration scenarios.
-
-For a 90-minute interview: spend 10 minutes on agent/server responsibilities, 15 on
-records/relationships, 20 on resolution and ambiguity, 20 on transactions and review
-tickets, 15 on the walkthrough/tests, and 10 on limits and extensions.
 
 The installed SDK was checked against the
 [official SDK README](https://github.com/modelcontextprotocol/python-sdk) and
@@ -347,13 +385,86 @@ uses official `mcp 2.2.0` APIs (`MCPServer`, `Client`), constrained to `mcp>=2.2
 with Pydantic 2.x. It does not install standalone FastMCP or mix v1 and v2 imports.
 `requirements-tested.txt` records the tested dependency versions.
 
-### Latest verification
+## License
 
-- Full suite: **37 passed in 3.95s** on Python 3.12 / MCP 2.2.0.
-- `examples/walkthrough.py`: completed successfully through real stdio, including
-  feedback creation, retry, wrong-link removal and retrieval after restart.
-- Compilation checks passed; `pip check` reported no broken requirements.
-- Stdio tests/walkthrough ran outside the sandbox because this environment's sandbox
-  previously prevented the subprocess handshake. Test databases were temporary.
-- Free-form model behavior was not evaluated; confirmation text in the walkthrough
-  is prescribed scenario input. The server cannot verify an agent's reported user answer.
+MIT License
+
+Copyright (c) 2026 Anchor MCP contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## Fewer MCP round trips with batches
+
+The server instructions now prefer these tools for multiple reads or existing-record
+updates. Restart/reconnect the MCP server so your coding agent sees the new tool catalog.
+Existing single-operation tools and collection-discovery safeguards remain available.
+
+- `batch_read(requests)`: mix searches, contexts and collection lists in one consistent
+  read transaction. A search with `include_context: true` returns full record context for
+  its result page, avoiding follow-up calls for those records. Results are ordered and
+  labeled with zero-based `item_index`. Each search retains its own pagination cursor.
+- `batch_resolve_records(requests)`: resolve multiple names or IDs in one call, returning
+  a separate resolution ticket and identity evidence for each item.
+- `prepare_batch_write(actions)` then `commit_batch_write(action_id)`: preview and commit
+  multiple existing-record updates, archives, renames, aliases, self mappings or relationship
+  changes. Every item has its own `review_ids`, `decision_reason` and, when necessary,
+  actual `clarification`. Argument shapes are the same as `prepare_write`.
+
+Example reporting request once collection IDs are known:
+
+```json
+{
+  "requests": [
+    {"operation": "search_records", "collection_id": "OPENINGS_ID", "limit": 20, "include_context": true},
+    {"operation": "search_records", "collection_id": "APPLICATIONS_ID", "limit": 20, "include_context": true},
+    {"operation": "search_records", "collection_id": "INTERVIEWS_ID", "limit": 20, "include_context": true}
+  ]
+}
+```
+
+Use `batch_read` for that request. Do not infer total counts from an incomplete page;
+follow each `next_cursor`. Context is one hop, with truncation flags in each direction.
+Batch contexts default to `event_limit: 0`: history is explicitly marked omitted, not
+empty. Request `event_limit: 1` through `100` when history is relevant; the standalone
+context tool keeps its previous default of 10 events.
+
+A three-record update can use **3 calls instead of 9**: resolve all three, prepare all
+three, commit once. Clarification or further identity discovery can still require more
+calls. All reviews are checked against the same pre-write snapshot, then actions run
+in order. Multiple writes to the same record need successive `expected_version` values.
+Any error rolls back all writes and audit events. Successful action IDs are replayable
+without repeating mutations, including after restart. Each audit decision retains its
+item index, batch action ID and review evidence. Freshness, expiry, actor/workspace
+isolation and per-item ambiguity checks still apply.
+
+Batches contain 1–10 items. Read page limits plus standalone context/catalog items have
+a budget of 100; responses are capped at 2 MB. Split oversized batches and refresh
+reviews after committed writes. Creation and collection changes continue through the
+existing single-write discovery workflow, preserving duplicate checks and collection
+clarity. Dependent steps requiring newly discovered IDs still need another round trip.
+
+To reproduce a comparison against an isolated temporary database:
+
+```bash
+.venv/bin/python -m examples.batch_benchmark
+```
+
+This compares identical results for seven reads versus one batch and nine calls for
+three updates versus three batch calls. Timings include local MCP transport, not model
+reasoning, app overhead or production-scale data. They do not predict total chat latency.

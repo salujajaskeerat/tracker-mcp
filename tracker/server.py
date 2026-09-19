@@ -2,16 +2,23 @@
 import logging
 import sqlite3
 import sys
-from typing import Any, Literal
 from collections.abc import Callable
+from typing import Any, Literal
 
 from mcp.server import MCPServer
 from pydantic import JsonValue
 
+from .batch import Batch, ReadRequest, ResolveRequest, WriteRequest
 from .service import Tracker, TrackerError
 from .workflow import Workflow
 
 AGENT_INSTRUCTIONS = """
+Prefer batch_read for multiple searches or contexts; include_context on searches
+avoids a second round trip for returned records. Request events only when needed.
+Respect each page cursor and truncation flag; partial pages are not total counts.
+For multiple existing-record writes, prefer batch_resolve_records, prepare_batch_write,
+then commit_batch_write. Each item still needs its own identity evidence and reason.
+Dependent discoveries may require another call; never guess missing IDs to batch.
 Act as a friendly organizer. Discover collections by name AND purpose before proposing
 new collections. Read the full returned catalog and examples, including collections
 not ranked as similar: lexical similarity cannot establish semantic equivalence.
@@ -45,6 +52,7 @@ perfectly detect semantic duplicates, and cannot verify what the user actually s
 def build_server(tracker: Tracker) -> MCPServer:
     server = MCPServer("Local generic tracker", instructions=AGENT_INSTRUCTIONS)
     workflow = Workflow(tracker)
+    batch = Batch(workflow)
 
     def call(operation: Callable, *args) -> dict[str, Any]:
         try:
@@ -60,6 +68,43 @@ def build_server(tracker: Tracker) -> MCPServer:
     def guarded_only() -> dict[str, Any]:
         return {"ok": False, "error": {"code": "REVIEW_REQUIRED", "message":
             "Direct writes are disabled. Use discover_collections/resolve_record, then prepare_write and commit_write."}}
+
+    @server.tool()
+    def batch_read(requests: list[ReadRequest]) -> dict[str, Any]:
+        """Read 1–10 mixed searches, contexts or catalogs in one consistent snapshot.
+        Searches may include_context to return full records and one-hop links for the page.
+        Total search limits plus standalone context/catalog items must be <=100.
+        Each search retains its own next_cursor. Context event_limit defaults to 0 (omitted,
+        not absent); set 1–100 for history. Relationship limits apply per direction.
+        Ordered results carry item_index; any failure rejects the call. Max response 2 MB.
+        Reads do not authorize writes: use resolution tickets for those."""
+        return call(batch.read, requests)
+
+    @server.tool()
+    def batch_resolve_records(requests: list[ResolveRequest]) -> dict[str, Any]:
+        """Resolve 1–10 names/IDs together with the same safeguards as resolve_record.
+        Returns ordered, independent resolution tickets and candidate context. Handle each
+        ambiguous or misspelled name separately; batching is not identity confirmation."""
+        return call(batch.resolve, requests)
+
+    @server.tool()
+    def prepare_batch_write(actions: list[WriteRequest]) -> dict[str, Any]:
+        """Preview 1–10 existing-record writes atomically; returns one action_id.
+        Each item uses the argument shape documented by prepare_write, its review_ids,
+        decision_reason and optional actual clarification. All reviews are validated against
+        the same initial snapshot. Items then execute in order with version checks; repeated
+        writes to one record must use successive expected_version values. Nothing is changed.
+        Creation and collection changes use the existing single-write discovery workflow.
+        Any failing operation rejects the entire batch with a zero-based item_index."""
+        return call(batch.prepare, actions)
+
+    @server.tool()
+    def commit_batch_write(action_id: str) -> dict[str, Any]:
+        """Commit the prepared batch all-or-nothing, including per-item audit evidence.
+        Freshness/actor/workspace and versions are checked. Expiry is 15 minutes.
+        Retry the same successful action_id safely, including after server restart.
+        On failure no item commits; refresh stale reviews, never blindly substitute versions."""
+        return call(batch.commit, action_id)
 
     @server.tool()
     def discover_collections(name: str, purpose: str) -> dict[str, Any]:
@@ -145,7 +190,8 @@ def build_server(tracker: Tracker) -> MCPServer:
     @server.tool()
     def get_record_context(record_id: str, relationship_limit: int = 20, event_limit: int = 10) -> dict[str, Any]:
         """Get record/version, one-hop incoming/outgoing links and recent events, including
-        archived records. Limits 1–100; relationship limit applies per direction. Truncation
+        archived records. Limits 1–100; event_limit=0 omits history explicitly.
+        Relationship limit applies per direction. Truncation
         flags indicate omitted results. Follow a returned ID explicitly for another hop."""
         return call(tracker.get_record_context, record_id, relationship_limit, event_limit)
 

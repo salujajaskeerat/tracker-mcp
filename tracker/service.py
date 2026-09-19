@@ -1,9 +1,9 @@
 """Domain-neutral operations; all identity comes from configured local context."""
 import base64
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from pydantic import JsonValue, TypeAdapter, ValidationError
@@ -301,24 +301,33 @@ class Tracker:
 
     def get_record_context(self, record_id, relationship_limit=20, event_limit=10):
         bounded(relationship_limit, "relationship_limit")
-        bounded(event_limit, "event_limit")
+        bounded(event_limit, "event_limit", low=0)
         with self.db.connect() as con:
             result = {"record": record(self._record(con, record_id))}
             # Separate directional limits prevent one direction from hiding the other.
             for direction, column, other in (("outgoing", "source_id", "target_id"),
                                               ("incoming", "target_id", "source_id")):
-                rows = con.execute(f"""SELECT * FROM relationships WHERE workspace_id=?
-                    AND {column}=? ORDER BY created_at, id LIMIT ?""",
+                rows = con.execute(f"""SELECT rel.*, r.title AS linked_title, r.collection_id AS linked_collection_id,
+                    r.version AS linked_version, r.archived_at AS linked_archived_at,
+                    r.data_json AS linked_data_json, c.name AS linked_collection_name
+                    FROM relationships rel JOIN records r ON r.id=rel.{other} AND r.workspace_id=rel.workspace_id
+                    JOIN collections c ON c.id=r.collection_id AND c.workspace_id=r.workspace_id
+                    WHERE rel.workspace_id=? AND rel.{column}=? ORDER BY rel.created_at, rel.id LIMIT ?""",
                     (self.workspace, record_id, relationship_limit + 1)).fetchall()
                 links = []
                 for row in rows[:relationship_limit]:
-                    linked = con.execute("""SELECT r.*, c.name AS collection_name FROM records r
-                        JOIN collections c ON c.id=r.collection_id WHERE r.workspace_id=? AND r.id=?""",
-                        (self.workspace, row[other])).fetchone()
-                    links.append({**dict(row), "linked_record": summary(linked)})
+                    linked = {key: row["linked_" + key] for key in
+                              ("title", "collection_id", "version", "archived_at", "data_json", "collection_name")}
+                    linked["id"] = row[other]
+                    relationship = {key: row[key] for key in
+                                    ("id", "workspace_id", "source_id", "relationship_type", "target_id", "created_by", "created_at")}
+                    links.append({**relationship, "linked_record": summary(linked)})
                 result[direction] = links
                 result[direction + "_truncated"] = len(rows) > relationship_limit
-            history = self._history(con, record_id, event_limit)
-            result.update(events=history["events"], events_truncated=history["next_cursor"] is not None,
-                          events_next_cursor=history["next_cursor"])
+            if event_limit == 0:
+                result.update(events=[], events_included=False, events_truncated=None, events_next_cursor=None)
+            else:
+                history = self._history(con, record_id, event_limit)
+                result.update(events=history["events"], events_truncated=history["next_cursor"] is not None,
+                              events_next_cursor=history["next_cursor"])
             return result

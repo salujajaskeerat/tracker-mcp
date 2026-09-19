@@ -58,22 +58,22 @@ class Workflow:
                 digest.update(canonical(dict(row)).encode())
         return digest.hexdigest()
 
-    def _save(self, con, kind, payload):
+    def _save(self, con, kind, payload, fingerprint=None):
         ticket_id = uid()
         expires = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(timespec="microseconds")
         con.execute("INSERT INTO workflow_tickets VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
                     (ticket_id, self.t.workspace, self.t.actor, kind, canonical(payload),
-                     self._fingerprint(con), expires))
+                     fingerprint if fingerprint is not None else self._fingerprint(con), expires))
         return ticket_id
 
-    def _load(self, con, ticket_id, kind, replay=False):
+    def _load(self, con, ticket_id, kind, replay=False, fingerprint=None):
         row = con.execute("""SELECT * FROM workflow_tickets WHERE id=? AND workspace_id=?
             AND actor_id=? AND kind=?""", (ticket_id, self.t.workspace, self.t.actor, kind)).fetchone()
         if not row:
             raise TrackerError("NOT_FOUND", "Review ticket not found for this workspace and actor")
         if replay and row["result_json"] is not None:
             return json.loads(row["payload_json"]), json.loads(row["result_json"])
-        if row["expires_at"] < now() or row["fingerprint"] != self._fingerprint(con):
+        if row["expires_at"] < now() or row["fingerprint"] != (fingerprint if fingerprint is not None else self._fingerprint(con)):
             raise TrackerError("STALE_REVIEW", "Context changed or review expired; discover/resolve again")
         return json.loads(row["payload_json"]), None
 
@@ -113,7 +113,7 @@ class Workflow:
             result["discovery_id"] = self._save(con, "discovery", result)
             return result
 
-    def resolve_record(self, query, collection_id=None, context_record_ids=None):
+    def resolve_record(self, query, collection_id=None, context_record_ids=None, *, _snapshot=None):
         query = text(query, "query")
         context_record_ids = context_record_ids or []
         if not isinstance(context_record_ids, list) or len(context_record_ids) > 10:
@@ -173,12 +173,12 @@ class Workflow:
                       "candidates": candidates[:CANDIDATE_LIMIT], "complete": complete, "status": status,
                       "selected_record_id": exact[0]["id"] if status == "resolved" else None,
                       "guidance": "Names are not unique. Fuzzy/ambiguous candidates require a focused question or independent identity evidence. No match is not proof of absence. Never infer links from recency."}
-            result["resolution_id"] = self._save(con, "resolution", result)
+            result["resolution_id"] = self._save(con, "resolution", result, fingerprint=_snapshot)
             return result
 
-    def _selection(self, con, record_id, reviews, clarification):
+    def _selection(self, con, record_id, reviews, clarification, fingerprint=None):
         for review_id in reviews:
-            result, _ = self._load(con, review_id, "resolution")
+            result, _ = self._load(con, review_id, "resolution", fingerprint=fingerprint)
             if not result["complete"]:
                 continue
             if record_id in {c["id"] for c in result["candidates"]}:
@@ -212,7 +212,7 @@ class Workflow:
             return {"action_id": action_id, "operation": operation, "arguments": arguments,
                     "preview": result, "note": "Preview only. IDs/timestamps for new objects are provisional. Commit action_id without changing arguments. No extra user approval is needed when intent and identity are already clear."}
 
-    def _validate(self, con, operation, args, reviews, clarification):
+    def _validate(self, con, operation, args, reviews, clarification, fingerprint=None):
         fields = {
             "create_collection": ({"name", "purpose", "record_meaning", "typical_fields", "relationship_guidance"}, set()),
             "update_collection": ({"collection_id", "name", "purpose", "record_meaning", "typical_fields", "relationship_guidance"}, set()),
@@ -239,7 +239,7 @@ class Workflow:
             discovery = None
             for review in reviews:
                 # Collection operations consume discovery tickets only.
-                candidate, _ = self._load(con, review, "discovery")
+                candidate, _ = self._load(con, review, "discovery", fingerprint=fingerprint)
                 if candidate["complete"]:
                     discovery = candidate
                     break
@@ -266,7 +266,7 @@ class Workflow:
             self.t._collection(con, args["collection_id"])
             matches = []
             for review in reviews:
-                candidate, _ = self._load(con, review, "resolution")
+                candidate, _ = self._load(con, review, "resolution", fingerprint=fingerprint)
                 if candidate["collection_id"] == args["collection_id"] and normalize(candidate["query"]) == normalize(args["title"]) and not candidate["context_record_ids"]:
                     matches.append(candidate)
             if not matches or not any(r["complete"] for r in matches):
@@ -283,7 +283,7 @@ class Workflow:
                 raise TrackerError("NOT_FOUND", "Relationship not found")
             ids = [link["source_id"], link["target_id"]]
         for rid in ids:
-            self._selection(con, rid, reviews, clarification)
+            self._selection(con, rid, reviews, clarification, fingerprint=fingerprint)
         if operation in {"add_record_alias", "remove_record_alias", "set_self"} and not clarification:
             raise TrackerError("NEEDS_CLARIFICATION", "Aliases and self mappings require an explicit user statement")
 
@@ -370,31 +370,34 @@ class Workflow:
                 return replay
             self._validate(con, payload["operation"], payload["arguments"], payload["review_ids"], payload["agent_reported_clarification"])
             result = self._perform(con, payload["operation"], payload["arguments"])
-            # Retain review evidence so the decision is understandable after expiry.
-            evidence = []
-            for review in payload["review_ids"]:
-                row = con.execute("SELECT kind, payload_json FROM workflow_tickets WHERE id=? AND workspace_id=? AND actor_id=?",
-                                  (review, self.t.workspace, self.t.actor)).fetchone()
-                reviewed = json.loads(row["payload_json"])
-                evidence.append({"review_id": review, "kind": row["kind"], "query": reviewed.get("query", reviewed.get("name")),
-                                 "purpose": reviewed.get("purpose"), "status": reviewed["status"],
-                                 "candidate_ids": [c["id"] for c in reviewed["candidates"]]})
-            audit = {**payload, "action_id": action_id, "evidence": evidence,
-                     "attribution_note": "Reason and clarification are agent-reported, not authenticated user consent."}
-            op, args = payload["operation"], payload["arguments"]
-            if "collection" in op:
-                cid = result.get("collection_id", result.get("id"))
-                self.t._collection_event(con, cid, "decision", None, audit)
-            else:
-                rid = args.get("record_id", args.get("source_id"))
-                if op == "create_record":
-                    rid = result["id"]
-                if op == "unlink_records":
-                    rid = result["removed"]["source_id"]
-                self.t._event(con, rid, "decision", None, audit)
-                if op == "create_record":
-                    self.t._collection_event(con, args["collection_id"], "reuse", None,
-                                             {"record_id": rid, "decision_reason": payload["decision_reason"],
-                                              "attribution_note": "Agent-reported collection choice"})
+            self._audit_decision(con, payload, result, action_id)
             con.execute("UPDATE workflow_tickets SET result_json=? WHERE id=?", (canonical(result), action_id))
             return result
+
+    def _audit_decision(self, con, payload, result, action_id):
+        # Retain review evidence so the decision is understandable after expiry.
+        evidence = []
+        for review in payload["review_ids"]:
+            row = con.execute("SELECT kind, payload_json FROM workflow_tickets WHERE id=? AND workspace_id=? AND actor_id=?",
+                              (review, self.t.workspace, self.t.actor)).fetchone()
+            reviewed = json.loads(row["payload_json"])
+            evidence.append({"review_id": review, "kind": row["kind"], "query": reviewed.get("query", reviewed.get("name")),
+                             "purpose": reviewed.get("purpose"), "status": reviewed["status"],
+                             "candidate_ids": [c["id"] for c in reviewed["candidates"]]})
+        audit = {**payload, "action_id": action_id, "evidence": evidence,
+                 "attribution_note": "Reason and clarification are agent-reported, not authenticated user consent."}
+        op, args = payload["operation"], payload["arguments"]
+        if "collection" in op:
+            cid = result.get("collection_id", result.get("id"))
+            self.t._collection_event(con, cid, "decision", None, audit)
+        else:
+            rid = args.get("record_id", args.get("source_id"))
+            if op == "create_record":
+                rid = result["id"]
+            if op == "unlink_records":
+                rid = result["removed"]["source_id"]
+            self.t._event(con, rid, "decision", None, audit)
+            if op == "create_record":
+                self.t._collection_event(con, args["collection_id"], "reuse", None,
+                                         {"record_id": rid, "decision_reason": payload["decision_reason"],
+                                          "attribution_note": "Agent-reported collection choice"})
