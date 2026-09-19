@@ -20,6 +20,7 @@ class SearchRead(Input):
     filters: dict[str, JsonValue] | None = None
     limit: int = Field(default=20, ge=1, le=100)
     cursor: str | None = None
+    text: str | None = None
     include_context: bool = False
     relationship_limit: int = Field(default=20, ge=1, le=100)
     event_limit: int = Field(default=0, ge=0, le=100)
@@ -89,7 +90,8 @@ class Batch:
                 try:
                     if isinstance(request, SearchRead):
                         result = self.t.search_records(request.collection_id, request.query,
-                                                       request.filters, request.limit, request.cursor)
+                                                       request.filters, request.limit, request.cursor,
+                                                       request.text)
                         if request.include_context:
                             result['contexts'] = [self.t.get_record_context(
                                 r['id'], request.relationship_limit, request.event_limit)

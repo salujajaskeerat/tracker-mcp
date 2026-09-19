@@ -157,7 +157,8 @@ SDK schema validation before a handler uses MCP `is_error=true` instead.
 | `list_collections()` | Names, IDs, descriptions and active counts (max 1000; truncation flag) |
 | `discover_collections(name, purpose)` | Full bounded catalog, examples, saved aliases, lexical suggestions and `discovery_id` |
 | `resolve_record(query, collection_id?, context_record_ids?)` | Candidates including archives, reasons, linked summaries, status and `resolution_id` |
-| `search_records(collection_id?, query?, filters?, limit=20, cursor?)` | Exact-filter/literal-title search of active records; paginated previews |
+| `search_records(collection_id?, query?, filters?, limit=20, cursor?, text?)` | Full-text (`text`), literal-title (`query`) and exact-filter search of active records; paginated previews |
+| `traverse(start_record_id, max_depth=2, direction="both", relationship_types?, collection_id?, max_nodes=50)` | Multi-hop walk over explicit links: reached records with depth and shortest path, plus walked relationships |
 | `get_record_context(record_id, relationship_limit=20, event_limit=10)` | Full record/version, one-hop links, recent audit events |
 | `prepare_write(operation, arguments, review_ids, decision_reason, clarification?)` | Validate the exact proposed write; return a preview and `action_id` without changing entities |
 | `commit_write(action_id)` | Atomically recheck context, apply exactly that action, and audit it |
@@ -298,7 +299,47 @@ Foreign workspace IDs/tickets return `NOT_FOUND`. All user SQL values are parame
 
 ## Search and storage details
 
-Search is Unicode-casefolded literal title substring matching: `%`/`_` are literal.
+### Full-text search (`text`)
+
+`search_records(text=...)` finds records by what they contain, not only by title. An SQLite
+FTS5 index covers each record's title and every string or number stored in its data, at any
+nesting depth. Key names are not indexed, so `text="notes"` does not match every record that
+has a `notes` field. Matching is case- and accent-insensitive (`zoe muller` finds `Zoë Müller`).
+
+- Every word must match the same record, and each word matches as a prefix: `interv` finds
+  `interview`. Punctuation and FTS5 operators (`AND`, `NEAR`, `-`, `:`, `*`) are plain text.
+- Results are ordered best match first using BM25, with title matches weighted four times
+  body matches. Each result carries a `match_snippet` with the matched words in brackets.
+- `text`, `query`, `filters` and `collection_id` combine with AND. Cursors work as before;
+  reuse the same parameters. Searches without `text` keep their oldest-first order.
+- Only active records are returned, as with every other search.
+
+Triggers on the `records` table maintain the index inside the writing transaction, so a
+rolled-back write or a `prepare_write` preview never leaves index entries behind. Opening an
+older database builds the index once; record, relationship and audit tables are untouched.
+If the local SQLite build lacks FTS5, `text` returns `UNSUPPORTED` and everything else works.
+
+### Multi-hop traversal (`traverse`)
+
+`traverse` answers questions that span linked records in one call instead of one
+`get_record_context` call per hop, for example person → applications → interviews → feedback.
+
+- The walk is breadth-first, 1–4 hops, over `outgoing`, `incoming` or `both` directions.
+  Each reached record is returned once with its `depth` and the first shortest `path` found:
+  ordered steps giving relationship type, direction, record ID and title.
+- `relationship_types` restricts which exact link types are followed. `collection_id` filters
+  which records are returned but not which are walked through, so “openings reachable from
+  this person” still routes through applications. `reached_count` reports the unfiltered total.
+- `edges` lists relationships walked between returned-or-intermediate records (at most 500).
+- `max_nodes` (1–200) caps reached records and each level scans at most 2000 relationships
+  per direction; `truncated` reports either limit being hit. Archived records are included
+  and flagged by `archived_at`. Cycles are safe: a record is never visited twice.
+
+Both tools are reads. They do not issue review tickets, so resolve records before writing.
+
+### Title and filter search
+
+`query` is Unicode-casefolded literal title substring matching: `%`/`_` are literal.
 JSON filters use AND-combined top-level keys. Dots in keys are literal; null differs
 from missing. Values compare as sorted-key canonical JSON: nested objects compare in
 full, arrays are ordered, strings are case-sensitive, booleans differ from numbers,
@@ -332,13 +373,14 @@ actual interview date must be stored separately when known, never invented.
 - Data, changes and prepared argument objects: 16 KiB canonical UTF-8 JSON; merged
   records also obey the limit. Finite JSON objects with string keys only.
 - Aliases: at most 20 per entity; collection guidance lists 1–20 optional field examples.
+- Full-text `text`: 300 characters, first 16 words used. Traversal: depth 1–4, 1–200 records.
 - Search/history/context limits: 1–100; context `event_limit=0` omits history. Links are capped per direction with
-  truncation flags; follow IDs explicitly. Relationship paging remains an extension.
+  truncation flags; use `traverse` or follow IDs explicitly. Relationship paging remains an extension.
 - Discovery scans at most 200 collections and returns up to three sample active records
   per collection. Resolution scans at most 1000 records in the selected collection
   or workspace and returns at most 20 candidates. Incomplete scans cannot authorize
   writes. Narrow record scope if possible; increasing scale needs paginated discovery.
-- SQLite initialization adds audit, alias and ticket tables without modifying existing
+- SQLite initialization adds the full-text index (and backfills it once) plus audit, alias and ticket tables without modifying existing
   collections/records/events. Existing collection descriptions remain unchanged; old
   collection events are not invented. The original four generic tables remain intact.
 

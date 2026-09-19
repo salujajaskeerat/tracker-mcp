@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -12,6 +13,9 @@ from .db import Database, canonical
 
 JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
 MAX_DATA_BYTES = 16_384
+MAX_TEXT_TOKENS = 16
+TRAVERSE_EDGE_SCAN_LIMIT = 2000
+TRAVERSE_EDGE_LIMIT = 500
 
 
 class TrackerError(Exception):
@@ -95,11 +99,26 @@ def decode_cursor(cursor, scope):
         invalid("Invalid cursor or cursor used with a different search/workspace")
 
 
-def next_cursor(rows, limit, scope):
+def next_cursor(rows, limit, scope, key="created_at"):
     if len(rows) <= limit:
         return None
     last = rows[limit - 1]
-    return base64.urlsafe_b64encode(canonical([scope, last["created_at"], last["id"]]).encode()).decode()
+    # repr() round-trips a relevance score exactly; timestamps are already strings.
+    position = last[key] if isinstance(last[key], str) else repr(last[key])
+    return base64.urlsafe_b64encode(canonical([scope, position, last["id"]]).encode()).decode()
+
+
+def fts_query(value):
+    """Turn free text into a safe FTS5 expression: every word must match, as a prefix.
+
+    Quoting each token keeps FTS5 operators (AND, NEAR, -, :, *) in user text literal.
+    """
+    if not isinstance(value, str) or len(value) > 300:
+        invalid("text must be a string of at most 300 characters")
+    tokens = re.findall(r"\w+", value)[:MAX_TEXT_TOKENS]
+    if not tokens:
+        invalid("text must contain at least one letter or digit")
+    return " ".join(f'"{token}"*' for token in tokens)
 
 
 class Tracker:
@@ -193,14 +212,34 @@ class Tracker:
             self._event(con, rid, "create", None, result)
             return result
 
-    def search_records(self, collection_id=None, query=None, filters=None, limit=20, cursor=None):
+    def search_records(self, collection_id=None, query=None, filters=None, limit=20, cursor=None,
+                       text=None):
         bounded(limit, "limit")
         if query is not None and (not isinstance(query, str) or len(query) > 300):
             invalid("query must be a string of at most 300 characters")
         encoded = object_json({} if filters is None else filters)
-        scope = cursor_scope("search", self.workspace, collection_id, query, json.loads(encoded))
+        match = None if text is None else fts_query(text)
+        if match is not None and not self.db.fts:
+            raise TrackerError("UNSUPPORTED", "This SQLite build lacks FTS5; use query and filters instead")
+        # Without text the cursor scope is unchanged, so cursors issued before this feature still work.
+        scope = cursor_scope("search", self.workspace, collection_id, query, json.loads(encoded),
+                             *([] if text is None else [text]))
         position = decode_cursor(cursor, scope)
+        # Text search ranks best match first (bm25: lower is better); otherwise oldest first.
+        source, order = "records r", "r.created_at"
         where, args = ["r.workspace_id=?", "r.archived_at IS NULL"], [self.workspace]
+        if match is not None:
+            source = """(SELECT rowid AS doc_id, bm25(record_fts, 4.0, 1.0) AS score,
+                    snippet(record_fts, -1, '[', ']', ' … ', 12) AS match_snippet
+                    FROM record_fts WHERE record_fts MATCH ?) h
+                JOIN record_search_keys k ON k.doc_id=h.doc_id JOIN records r ON r.id=k.record_id"""
+            order = "h.score"
+            args.insert(0, match)
+            if position:
+                try:
+                    position[0] = float(position[0])
+                except ValueError:
+                    invalid("Invalid cursor or cursor used with a different search/workspace")
         if collection_id is not None:
             where.append("r.collection_id=?")
             args.append(collection_id)
@@ -210,16 +249,21 @@ class Tracker:
         where.append("matches(r.data_json, ?)")
         args.append(encoded)
         if position:
-            where.append("(r.created_at, r.id) > (?, ?)")
+            where.append(f"({order}, r.id) > (?, ?)")
             args.extend(position)
         with self.db.connect() as con:
             if collection_id is not None:
                 self._collection(con, collection_id)
-            rows = con.execute("""SELECT r.*, c.name AS collection_name FROM records r
+            rows = con.execute(f"""SELECT r.*, c.name AS collection_name
+                {", h.score, h.match_snippet" if match is not None else ""} FROM {source}
                 JOIN collections c ON c.id=r.collection_id WHERE """ + " AND ".join(where)
-                + " ORDER BY r.created_at, r.id LIMIT ?", [*args, limit + 1]).fetchall()
-            return {"records": [summary(r) for r in rows[:limit]],
-                    "next_cursor": next_cursor(rows, limit, scope),
+                + f" ORDER BY {order}, r.id LIMIT ?", [*args, limit + 1]).fetchall()
+            records = [summary(r) for r in rows[:limit]]
+            if match is not None:
+                for item, row in zip(records, rows):
+                    item["match_snippet"] = row["match_snippet"]
+            return {"records": records,
+                    "next_cursor": next_cursor(rows, limit, scope, "created_at" if match is None else "score"),
                     "note": "No matches is not proof an entity does not exist; check spelling, scope, and archives."}
 
     def _change(self, record_id, expected_version, changes=None, archive=False):
@@ -331,3 +375,75 @@ class Tracker:
                 result.update(events=history["events"], events_truncated=history["next_cursor"] is not None,
                               events_next_cursor=history["next_cursor"])
             return result
+
+    def traverse(self, start_record_id, max_depth=2, direction="both", relationship_types=None,
+                 collection_id=None, max_nodes=50):
+        """Breadth-first walk: one bounded query per level and direction, not one call per hop.
+
+        Each reached record keeps the first (shortest) path found. collection_id filters what is
+        returned, not what is walked through, so intermediate records never block a route.
+        """
+        bounded(max_depth, "max_depth", high=4)
+        bounded(max_nodes, "max_nodes", high=200)
+        if direction not in ("outgoing", "incoming", "both"):
+            invalid("direction must be outgoing, incoming or both")
+        types = [] if relationship_types is None else relationship_types
+        if not isinstance(types, list) or len(types) > 20:
+            invalid("relationship_types must list at most 20 exact relationship types")
+        types = [text(t, "relationship_type", 100) for t in types]
+        with self.db.connect() as con:
+            start = self._record(con, start_record_id)
+            if collection_id is not None:
+                self._collection(con, collection_id)
+            paths, edges = {start_record_id: []}, {}
+            frontier, truncated = [start_record_id], False
+            for _ in range(max_depth):
+                if not frontier or truncated:
+                    break
+                found = []
+                for name, column, other in (("outgoing", "source_id", "target_id"),
+                                            ("incoming", "target_id", "source_id")):
+                    if direction not in (name, "both"):
+                        continue
+                    sql = f"""SELECT id, source_id, relationship_type, target_id FROM relationships
+                        WHERE workspace_id=? AND {column} IN ({", ".join("?" * len(frontier))})"""
+                    if types:
+                        sql += f" AND relationship_type IN ({', '.join('?' * len(types))})"
+                    rows = con.execute(sql + " ORDER BY created_at, id LIMIT ?",
+                        [self.workspace, *frontier, *types, TRAVERSE_EDGE_SCAN_LIMIT + 1]).fetchall()
+                    truncated = truncated or len(rows) > TRAVERSE_EDGE_SCAN_LIMIT
+                    for row in rows[:TRAVERSE_EDGE_SCAN_LIMIT]:
+                        edges[row["id"]] = dict(row)
+                        found.append((row, row[column], row[other], name))
+                frontier = []
+                for row, from_id, to_id, name in found:
+                    if to_id in paths:
+                        continue
+                    if len(paths) > max_nodes:  # the start record does not count
+                        truncated = True
+                        break
+                    paths[to_id] = [*paths[from_id], {
+                        "relationship_id": row["id"], "relationship_type": row["relationship_type"],
+                        "direction": name, "from_record_id": from_id, "record_id": to_id}]
+                    frontier.append(to_id)
+            reached = [rid for rid in paths if rid != start_record_id]
+            rows = con.execute(f"""SELECT r.*, c.name AS collection_name FROM records r
+                JOIN collections c ON c.id=r.collection_id AND c.workspace_id=r.workspace_id
+                WHERE r.workspace_id=? AND r.id IN ({", ".join("?" * len(reached))})""",
+                [self.workspace, *reached]).fetchall() if reached else []
+            found = {row["id"]: row for row in rows}
+            nodes = []
+            for rid in reached:
+                if collection_id is not None and found[rid]["collection_id"] != collection_id:
+                    continue
+                steps = [{**step, "title": found[step["record_id"]]["title"]} for step in paths[rid]]
+                nodes.append({**summary(found[rid]), "depth": len(steps), "path": steps})
+            walked = [e for e in edges.values() if e["source_id"] in paths and e["target_id"] in paths]
+            start_row = con.execute("""SELECT r.*, c.name AS collection_name FROM records r
+                JOIN collections c ON c.id=r.collection_id WHERE r.id=?""", (start["id"],)).fetchone()
+            return {"start": summary(start_row), "nodes": nodes, "reached_count": len(reached),
+                    "edges": walked[:TRAVERSE_EDGE_LIMIT],
+                    "edges_truncated": len(walked) > TRAVERSE_EDGE_LIMIT, "truncated": truncated,
+                    "note": "Paths are shortest routes over explicit links only. truncated means "
+                            "limits were hit: narrow relationship_types/direction or raise max_nodes. "
+                            "Use get_record_context for a record's full data and version."}

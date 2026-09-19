@@ -216,7 +216,7 @@ def test_mcp_stdio_integration(tmp_path):
                 "list_collections", "create_collection", "search_records", "get_record_context",
                 "create_record", "update_record", "link_records", "unlink_records", "get_record_history", "archive_record",
                 "discover_collections", "resolve_record", "prepare_write", "commit_write", "get_collection_history", "batch_read", "batch_resolve_records",
-                "prepare_batch_write", "commit_batch_write"}
+                "prepare_batch_write", "commit_batch_write", "traverse"}
             async def call(name, arguments):
                 result = await client.call_tool(name, arguments)
                 assert not result.is_error, result
@@ -236,6 +236,11 @@ def test_mcp_stdio_integration(tmp_path):
             created = (await call("commit_write", {"action_id": prepared["action_id"]}))["result"]
             assert created["created_by"] == "stdio-actor"
             assert (await call("search_records", {"filters": {"amount": 5}}))["result"]["records"][0]["id"] == created["id"]
+            found = (await call("search_records", {"text": "coff"}))["result"]["records"]
+            assert [r["id"] for r in found] == [created["id"]] and found[0]["match_snippet"] == "[Coffee]"
+            walk = (await call("traverse", {"start_record_id": created["id"], "max_depth": 3}))["result"]
+            assert walk["start"]["id"] == created["id"] and walk["nodes"] == []
+            assert (await call("traverse", {"start_record_id": created["id"], "max_depth": 9}))["error"]["code"] == "INVALID_INPUT"
             resolution = (await call("resolve_record", {"query": created["id"]}))["result"]
             assert (await call("prepare_write", {"operation": "update_record", "arguments": {
                 "record_id": created["id"], "changes": {}, "expected_version": 9},

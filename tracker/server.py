@@ -16,6 +16,9 @@ AGENT_INSTRUCTIONS = """
 Prefer batch_read for multiple searches or contexts; include_context on searches
 avoids a second round trip for returned records. Request events only when needed.
 Respect each page cursor and truncation flag; partial pages are not total counts.
+When the user describes a record by content (a note, company, skill, status) rather than
+its title, use search_records text. To answer questions spanning linked records, use one
+traverse call instead of repeated get_record_context hops. Both are reads, not identity proof.
 For multiple existing-record writes, prefer batch_resolve_records, prepare_batch_write,
 then commit_batch_write. Each item still needs its own identity evidence and reason.
 Dependent discoveries may require another call; never guess missing IDs to batch.
@@ -180,12 +183,16 @@ def build_server(tracker: Tracker) -> MCPServer:
     @server.tool()
     def search_records(collection_id: str | None = None, query: str | None = None,
                        filters: dict[str, JsonValue] | None = None, limit: int = 20,
-                       cursor: str | None = None) -> dict[str, Any]:
-        """Search active records by case-insensitive literal title substring; AND top-level
-        filters use canonical JSON equality (null differs from missing; nested values compare
-        in full). Return 1–100 bounded previews with an opaque cursor. Zero matches does not
-        establish nonexistence. Reuse the same search parameters with the next cursor."""
-        return call(tracker.search_records, collection_id, query, filters, limit, cursor)
+                       cursor: str | None = None, text: str | None = None) -> dict[str, Any]:
+        """Search active records. text = full-text search over titles AND every stored data
+        value at any depth (not key names): all words must match, case/accent-insensitive,
+        as prefixes ('interv' finds 'interview'); best match first with a match_snippet.
+        Use text when the user describes something by content rather than exact title.
+        query = case-insensitive literal title substring. AND top-level filters use canonical
+        JSON equality (null differs from missing; nested values compare in full). All three
+        combine with AND. Return 1–100 bounded previews with an opaque cursor. Zero matches
+        does not establish nonexistence. Reuse the same search parameters with the next cursor."""
+        return call(tracker.search_records, collection_id, query, filters, limit, cursor, text)
 
     @server.tool()
     def get_record_context(record_id: str, relationship_limit: int = 20, event_limit: int = 10) -> dict[str, Any]:
@@ -194,6 +201,22 @@ def build_server(tracker: Tracker) -> MCPServer:
         Relationship limit applies per direction. Truncation
         flags indicate omitted results. Follow a returned ID explicitly for another hop."""
         return call(tracker.get_record_context, record_id, relationship_limit, event_limit)
+
+    @server.tool()
+    def traverse(start_record_id: str, max_depth: int = 2,
+                 direction: Literal["outgoing", "incoming", "both"] = "both",
+                 relationship_types: list[str] | None = None, collection_id: str | None = None,
+                 max_nodes: int = 50) -> dict[str, Any]:
+        """Walk explicit links breadth-first up to max_depth (1–4) hops from one record in a
+        single call, e.g. person -> applications -> openings/interviews -> feedback. Returns each
+        reached record's preview, depth and shortest path (relationship types, directions and
+        titles), plus the relationships walked. relationship_types restricts which exact link
+        types are followed; collection_id filters which records are returned without blocking
+        routes through other collections. max_nodes 1–200 caps reached records; truncated
+        flags mean limits were hit. Includes archived records. Reading does not authorize
+        writes: resolve records before mutating them."""
+        return call(tracker.traverse, start_record_id, max_depth, direction, relationship_types,
+                    collection_id, max_nodes)
 
     @server.tool()
     def create_record(collection_id: str, title: str, data: dict[str, JsonValue]) -> dict[str, Any]:

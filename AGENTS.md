@@ -11,8 +11,8 @@ research, and other trackers. The server requires no embedded LLM, API key, or h
 
 - `tracker/`: Server implementation, storage, validation, guarded workflows, and demo seeding.
   - `__init__.py`: Python package marker.
-  - `db.py`: SQLite schema, canonical JSON helpers, and reusable transaction connections.
-  - `service.py`: Domain-neutral record, collection, relationship, and history operations.
+  - `db.py`: SQLite schema, FTS5 index triggers/backfill, canonical JSON helpers, and transaction connections.
+  - `service.py`: Domain-neutral record, collection, relationship, search, traversal, and history operations.
   - `workflow.py`: Discovery, identity resolution, review tickets, previews, commits, and decision audits.
   - `batch.py`: Bounded batch reads, resolution, and atomic existing-record writes.
   - `server.py`: Official MCP SDK tool registration, agent instructions, and stdio entry point.
@@ -49,6 +49,7 @@ Run focused tests:
 .venv/bin/python -m pytest -q tests/test_tracker.py
 .venv/bin/python -m pytest -q tests/test_workflow.py
 .venv/bin/python -m pytest -q tests/test_batch.py
+.venv/bin/python -m pytest -q tests/test_search.py
 ```
 
 Run storage and workflow tests without MCP subprocess tests:
@@ -199,7 +200,13 @@ All mutations and audits commit together or roll back together.
 reuse the current connection through a `ContextVar`. A read transaction cannot be promoted to a
 write transaction.
 
-Schema initialization adds missing tables and indexes. It does not supply a general migration
+Full-text search uses an FTS5 table over titles and JSON values. Triggers on `records` maintain it
+inside the writing transaction, so service code never updates the index directly and rollbacks stay
+exact. `record_search_keys` gives each record a stable integer rowid because implicit rowids can change
+on `VACUUM`. The index is derived data: it is excluded from review fingerprints and can be rebuilt.
+`traverse` is a bounded breadth-first read using one query per level and direction.
+
+Schema initialization adds missing tables and indexes and backfills the full-text index once. It does not supply a general migration
 framework or reconstruct audit history for legacy data.
 
 ## Testing Strategy
@@ -210,6 +217,8 @@ Use pytest and temporary SQLite databases. Tests must not depend on the user’s
   workspace boundaries, and real MCP stdio behavior.
 - `tests/test_workflow.py` covers typos, duplicate names, collection reuse, aliases, self mappings,
   stale and expired reviews, concurrency, migration, rollback, and idempotent replay.
+- `tests/test_search.py` covers full-text indexing, ranking, pagination, backfill, rollback safety,
+  the no-FTS5 fallback, and multi-hop traversal filters, cycles, limits, and scope.
 - `tests/test_batch.py` covers batch bounds, retrieval parity, pagination, per-item clarification,
   sequential versions, atomic rollback, audit evidence, scope, and MCP restart replay.
 - `examples/walkthrough.py` exercises a scripted hiring workflow through the official MCP client.
@@ -313,6 +322,8 @@ Prefer batching when the needed IDs and evidence are available. Preserve these l
 - Batch read budget: sum of search page limits plus standalone context/catalog items must be ≤100.
 - Batch response size: at most 2,000,000 canonical JSON bytes.
 - Search and history pages: 1–100 items.
+- Full-text search: 300 characters; the first 16 words are used; all must match as prefixes.
+- Traversal: depth 1–4, 1–200 reached records, 2000 scanned relationships per level and direction.
 - Context relationships: 1–100 per direction.
 - Context events: 0–100; zero means explicitly omitted history.
 - Data, changes, and prepared argument objects: at most 16 KiB of canonical UTF-8 JSON.
@@ -370,5 +381,6 @@ Console entry points are declared in `pyproject.toml`:
 - [Benchmark](examples/batch_benchmark.py): Local transport and batch comparison.
 - [Workflow tests](tests/test_workflow.py): Resolution and write-safety scenarios.
 - [Batch tests](tests/test_batch.py): Atomicity, retrieval, and MCP integration coverage.
+- [Search tests](tests/test_search.py): Full-text search and traversal coverage.
 
 > TODO: No `docs/ARCH.md`, ADR directory, or separate contributor guide is present.

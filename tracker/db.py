@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 import json
+import logging
 from pathlib import Path
 import sqlite3
 
@@ -63,6 +64,45 @@ CREATE INDEX IF NOT EXISTS relationship_target ON relationships(workspace_id, ta
 CREATE INDEX IF NOT EXISTS event_history ON events(workspace_id, record_id, created_at, id);
 """
 
+# Full-text index over titles and every JSON value (keys are not indexed). Triggers keep it
+# in step with records inside the same transaction, so rollbacks and previews stay exact.
+# record_search_keys supplies a stable integer rowid: records.rowid may change on VACUUM.
+FTS_BODY = """coalesce((SELECT group_concat(atom, ' | ') FROM json_tree({row}.data_json)
+        WHERE type IN ('text', 'integer', 'real')), '')"""
+FTS_INSERT = """INSERT INTO record_fts(rowid, title, body) VALUES (
+        (SELECT doc_id FROM record_search_keys WHERE record_id=new.id), new.title, """ \
+    + FTS_BODY.format(row="new") + ");"
+FTS_DELETE = "DELETE FROM record_fts WHERE rowid=(SELECT doc_id FROM record_search_keys WHERE record_id=old.id);"
+FTS_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS record_search_keys (
+    doc_id INTEGER PRIMARY KEY, record_id TEXT NOT NULL UNIQUE
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS record_fts USING fts5(
+    title, body, tokenize="unicode61 remove_diacritics 2"
+);
+CREATE TRIGGER IF NOT EXISTS record_fts_insert AFTER INSERT ON records BEGIN
+    INSERT INTO record_search_keys(record_id) VALUES (new.id);
+    {FTS_INSERT}
+END;
+CREATE TRIGGER IF NOT EXISTS record_fts_update AFTER UPDATE OF title, data_json ON records BEGIN
+    {FTS_DELETE}
+    {FTS_INSERT}
+END;
+CREATE TRIGGER IF NOT EXISTS record_fts_delete AFTER DELETE ON records BEGIN
+    {FTS_DELETE}
+    DELETE FROM record_search_keys WHERE record_id=old.id;
+END;
+"""
+# Idempotent backfill for databases created before the index existed.
+FTS_BACKFILL = f"""
+INSERT INTO record_search_keys(record_id) SELECT id FROM records
+    WHERE id NOT IN (SELECT record_id FROM record_search_keys) ORDER BY created_at, id;
+INSERT INTO record_fts(rowid, title, body)
+    SELECT k.doc_id, r.title, {FTS_BODY.format(row="r")}
+    FROM records r JOIN record_search_keys k ON k.record_id=r.id
+    WHERE k.doc_id NOT IN (SELECT rowid FROM record_fts);
+"""
+
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False,
@@ -82,6 +122,15 @@ class Database:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as con:
             con.executescript(SCHEMA)
+            try:
+                con.executescript(FTS_SCHEMA + "BEGIN IMMEDIATE;" + FTS_BACKFILL + "COMMIT;")
+                self.fts = True
+            except sqlite3.OperationalError as exc:
+                if "no such module" not in str(exc):
+                    raise
+                # SQLite built without FTS5: everything except text search keeps working.
+                logging.warning("SQLite FTS5 unavailable; full-text search is disabled")
+                self.fts = False
 
     @contextmanager
     def connect(self, write=False):
