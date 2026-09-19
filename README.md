@@ -117,7 +117,14 @@ After saving the client configuration, restart or reload the client and ask:
 the connection is working. The database is created automatically on first launch.
 
 Use an absolute database path in client configuration. Relative paths depend on the
-client’s working directory and can create a second, unexpected database.
+client’s working directory and can create a second, unexpected database. With
+`uv run --directory`, a relative path resolves inside this repository, not the folder you
+opened the client in.
+
+If the client reports a failed connection, run its exact command in a terminal. The
+server should start and wait silently; `Provide a command or script to invoke` means the
+trailing `tracker-mcp` argument is missing. In Claude Code, `claude mcp list` shows the
+registered command and its connection status.
 
 ### Optional: try the seeded demo
 
