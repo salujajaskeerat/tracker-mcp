@@ -12,6 +12,10 @@ dependencies = ["mcp>=2.2,<3", "pydantic>=2.13,<3"]
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
 
+# uv installs this group by default (`uv sync`); the `test` extra above remains for pip users.
+[dependency-groups]
+dev = ["pytest>=8,<10"]
+
 [project.scripts]
 tracker-mcp = "tracker.server:main"
 tracker-seed = "tracker.seed:main"

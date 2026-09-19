@@ -37,7 +37,25 @@ class CollectionsRead(Input):
     operation: Literal['list_collections']
 
 
-ReadRequest = Annotated[SearchRead | ContextRead | CollectionsRead, Field(discriminator='operation')]
+class TraverseRead(Input):
+    operation: Literal['traverse']
+    start_record_id: str
+    max_depth: int = Field(default=2, ge=1, le=4)
+    direction: Literal['outgoing', 'incoming', 'both'] = 'both'
+    relationship_types: list[str] | None = Field(default=None, max_length=20)
+    collection_id: str | None = None
+    max_nodes: int = Field(default=50, ge=1, le=100)
+
+
+ReadRequest = Annotated[SearchRead | ContextRead | CollectionsRead | TraverseRead,
+                        Field(discriminator='operation')]
+
+
+def read_cost(request):
+    # Records a request may return: search pages and traversals count in full.
+    if isinstance(request, SearchRead):
+        return request.limit
+    return request.max_nodes if isinstance(request, TraverseRead) else 1
 
 
 class ResolveRequest(Input):
@@ -82,8 +100,8 @@ class Batch:
 
     def read(self, requests):
         requests = parse_items(requests, ReadRequest)
-        if sum(r.limit if isinstance(r, SearchRead) else 1 for r in requests) > 100:
-            invalid('Batch search/context record budget is 100; reduce page limits')
+        if sum(read_cost(r) for r in requests) > 100:
+            invalid('Batch record budget is 100; reduce search limits or traverse max_nodes')
         results = []
         with self.t.db.connect():
             for index, request in enumerate(requests):
@@ -98,6 +116,9 @@ class Batch:
                                 for r in result['records']]
                     elif isinstance(request, ContextRead):
                         result = self.t.get_record_context(request.record_id, request.relationship_limit, request.event_limit)
+                    elif isinstance(request, TraverseRead):
+                        result = self.t.traverse(request.start_record_id, request.max_depth, request.direction,
+                                                 request.relationship_types, request.collection_id, request.max_nodes)
                     else:
                         result = self.t.list_collections()
                     results.append({'item_index': index, 'operation': request.operation, 'result': result})

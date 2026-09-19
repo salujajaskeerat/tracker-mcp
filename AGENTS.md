@@ -19,43 +19,40 @@ research, and other trackers. The server requires no embedded LLM, API key, or h
   - `seed.py`: Explicit hiring example that refuses an existing database path.
 - `tests/`: Pytest coverage for storage, workflow safeguards, batches, and real MCP subprocesses.
 - `examples/`: Scripted MCP walkthrough and batch performance comparison using temporary databases.
-- `pyproject.toml`: Package metadata, dependencies, setuptools configuration, and command entry points.
-- `requirements-tested.txt`: Recorded dependency versions from the tested environment.
+- `pyproject.toml`: Package metadata, dependencies, uv `dev` group, setuptools configuration, and entry points.
+- `uv.lock`: Authoritative locked dependency versions, maintained by uv.
+- `requirements-tested.txt`: Recorded dependency versions for pip users without uv.
 - `.gitignore`: Excludes virtual environments, caches, package metadata, and SQLite database files.
 - `README.md`: Setup, tool contracts, examples, limitations, and MIT license text.
 
 ## Build & Development Commands
 
-Run commands from the repository root. Python 3.11 or newer is required.
+Run commands from the repository root. Python 3.11 or newer is required; uv downloads one if needed.
 
-Install the editable package:
-
-```bash
-python3 --version                 # 3.11 or newer
-python3 -m venv .venv
-.venv/bin/python -m pip install -e .
-```
-
-Install test dependencies and run the full suite:
+The project is managed with uv. `uv sync` creates `.venv` from `uv.lock`, installs the package in
+editable mode, and includes the `dev` dependency group (pytest):
 
 ```bash
-.venv/bin/python -m pip install -e '.[test]'
-.venv/bin/python -m pytest -q
+uv sync
+uv run pytest -q
 ```
+
+Change dependencies with `uv add`, `uv add --dev`, or `uv remove`, never by editing `uv.lock` by hand.
+Commit `pyproject.toml` and `uv.lock` together. Upgrade with `uv lock --upgrade` followed by `uv sync`.
 
 Run focused tests:
 
 ```bash
-.venv/bin/python -m pytest -q tests/test_tracker.py
-.venv/bin/python -m pytest -q tests/test_workflow.py
-.venv/bin/python -m pytest -q tests/test_batch.py
-.venv/bin/python -m pytest -q tests/test_search.py
+uv run pytest -q tests/test_tracker.py
+uv run pytest -q tests/test_workflow.py
+uv run pytest -q tests/test_batch.py
+uv run pytest -q tests/test_search.py
 ```
 
 Run storage and workflow tests without MCP subprocess tests:
 
 ```bash
-.venv/bin/python -m pytest -q -k 'not stdio'
+uv run pytest -q -k 'not stdio'
 ```
 
 Run the server with explicit local settings:
@@ -65,7 +62,7 @@ export TRACKER_DB_PATH="$PWD/tracker.db"
 export TRACKER_WORKSPACE_ID="local"
 export TRACKER_ACTOR_ID="local-agent"
 
-.venv/bin/python -m tracker.server
+uv run tracker-mcp
 ```
 
 The server communicates through stdio and waits for an MCP client. Protocol output belongs on stdout;
@@ -74,8 +71,8 @@ diagnostic logging belongs on stderr. The installed `tracker-mcp` entry point in
 Run a fresh demo database:
 
 ```bash
-TRACKER_DB_PATH="$PWD/demo.db" .venv/bin/python -m tracker.seed
-TRACKER_DB_PATH="$PWD/demo.db" .venv/bin/python -m tracker.server
+TRACKER_DB_PATH="$PWD/demo.db" uv run tracker-seed
+TRACKER_DB_PATH="$PWD/demo.db" uv run tracker-mcp
 ```
 
 The seed command refuses an existing path, including an empty file. Use another filename if needed.
@@ -83,21 +80,21 @@ The seed command refuses an existing path, including an empty file. Use another 
 Run the temporary-database walkthrough and benchmark:
 
 ```bash
-.venv/bin/python examples/walkthrough.py
-.venv/bin/python -m examples.batch_benchmark
+uv run python examples/walkthrough.py
+uv run python -m examples.batch_benchmark
 ```
 
 Check syntax and installed dependency compatibility:
 
 ```bash
-.venv/bin/python -m compileall -q tracker tests examples
-.venv/bin/python -m pip check
+uv run python -m compileall -q tracker tests examples
+uv pip check
 ```
 
 Debug a failing test:
 
 ```bash
-.venv/bin/python -m pytest -x --pdb tests/test_batch.py
+uv run pytest -x --pdb tests/test_batch.py
 ```
 
 Do not start an interactive debugger on the server’s MCP protocol streams.
@@ -106,8 +103,8 @@ Do not start an interactive debugger on the server’s MCP protocol streams.
 
 > TODO: No static type checker or type-check command is defined.
 
-> TODO: No release build or automated deployment command is documented. The supported setup uses an
-> editable install and an MCP client that launches the server.
+> TODO: No release build or automated deployment command is documented. The supported setup is an
+> MCP client launching `uv run --directory <repo> tracker-mcp`.
 
 Check the client's configured executable before claiming a change is deployed. Source edits do not
 automatically update separately installed runtime copies.
@@ -174,7 +171,8 @@ Its Python API is an internal/admin interface. MCP clients must use the guarded 
 the six legacy direct-write tools return `REVIEW_REQUIRED`.
 
 `workflow.py` resolves records using normalized names, aliases, stable IDs, and explicit linked
-context. Collection discovery returns purpose descriptions and examples for the agent to review.
+context. Candidate scoring runs inside SQLite through a registered function so every name in scope is
+compared; a word index cannot replace it because typos share no indexed terms. Collection discovery returns purpose descriptions and examples for the agent to review.
 Fuzzy scores rank suggestions; they do not prove identity or semantic equivalence.
 
 The write sequence is:
@@ -227,13 +225,13 @@ Use pytest and temporary SQLite databases. Tests must not depend on the user’s
 Run the complete suite before handing off changes to storage, workflow validation, or batching:
 
 ```bash
-.venv/bin/python -m pytest -q
+uv run pytest -q
 ```
 
 For MCP changes, explicitly include the subprocess integration tests:
 
 ```bash
-.venv/bin/python -m pytest -q -k stdio
+uv run pytest -q -k stdio
 ```
 
 Some constrained environments can prevent the stdio subprocess handshake. Report this limitation
@@ -274,14 +272,14 @@ database or process access can bypass the application workflow.
 - Record clarification and decision reasons as agent-reported evidence, not authenticated consent.
 - Keep stdout reserved for MCP protocol traffic.
 
-Dependency ranges live in `pyproject.toml`; tested versions are recorded in
-`requirements-tested.txt`. The project uses the official MCP 2.x SDK and Pydantic 2.x.
+Dependency ranges live in `pyproject.toml`; exact versions are locked in `uv.lock` and mirrored for
+pip users in `requirements-tested.txt`. The project uses the official MCP 2.x SDK and Pydantic 2.x.
 
 ```bash
-.venv/bin/python -m pip check
+uv pip check
 ```
 
-`pip check` checks dependency compatibility; it is not a vulnerability scanner.
+`uv pip check` checks dependency compatibility; it is not a vulnerability scanner.
 
 > TODO: No dependency vulnerability scanner or automated security audit is configured.
 
@@ -319,7 +317,8 @@ and identity are already clear. Never fabricate clarification or learn aliases f
 Prefer batching when the needed IDs and evidence are available. Preserve these limits:
 
 - Batches: 1–10 items.
-- Batch read budget: sum of search page limits plus standalone context/catalog items must be ≤100.
+- Batch read budget: search page limits plus traverse `max_nodes` plus standalone context/catalog
+  items must be ≤100.
 - Batch response size: at most 2,000,000 canonical JSON bytes.
 - Search and history pages: 1–100 items.
 - Full-text search: 300 characters; the first 16 words are used; all must match as prefixes.
@@ -327,7 +326,8 @@ Prefer batching when the needed IDs and evidence are available. Preserve these l
 - Context relationships: 1–100 per direction.
 - Context events: 0–100; zero means explicitly omitted history.
 - Data, changes, and prepared argument objects: at most 16 KiB of canonical UTF-8 JSON.
-- Resolution: at most 1000 scanned records and 20 returned candidates.
+- Resolution: every title and alias in scope is scored in SQLite, up to 100,000 records; 20 returned
+  candidates. More matches or a larger scope is incomplete.
 - Discovery: at most 200 scanned collections.
 - Incomplete reviews cannot authorize writes.
 
@@ -372,7 +372,8 @@ Console entry points are declared in `pyproject.toml`:
 - [README](README.md): Setup, configuration, tool contracts, examples, and limitations.
 - [Batch usage](README.md#fewer-mcp-round-trips-with-batches): Retrieval and atomic write batching.
 - [Package configuration](pyproject.toml): Dependencies, scripts, and pytest settings.
-- [Tested dependencies](requirements-tested.txt): Recorded package versions.
+- [Lockfile](uv.lock): Authoritative dependency versions.
+- [Tested dependencies](requirements-tested.txt): Recorded package versions for pip users.
 - [Storage implementation](tracker/db.py): Schema and transaction management.
 - [Workflow implementation](tracker/workflow.py): Identity review and guarded writes.
 - [Batch implementation](tracker/batch.py): Batch bounds and execution behavior.

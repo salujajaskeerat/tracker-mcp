@@ -345,3 +345,39 @@ def test_collection_rename_cannot_create_normalized_duplicate(setup):
     fails("INVALID_INPUT", w.prepare_write, "update_collection", args, [d["discovery_id"]],
           "Attempt to rename", "A clarification cannot override exact normalized uniqueness")
     assert {c["name"] for c in t.list_collections()["collections"]} == {existing["name"], "projects"}
+
+
+def test_resolution_covers_large_collections_without_missing_typos_or_aliases(setup):
+    from tracker.service import now, uid
+    t, w = setup
+    target = make_person(t, "Jaskeerat Saluja")
+    nicknamed = make_person(t, "Zed")
+    review = w.resolve_record("Zed", target["collection_id"])
+    w.commit_write(w.prepare_write("add_record_alias", {"record_id": nicknamed["id"], "alias": "Captain",
+        "expected_version": 1}, [review["resolution_id"]], "User said so", "User calls Zed Captain")["action_id"])
+    with t.db.connect(write=True) as con:  # well past the former 1000-record scan ceiling
+        for index in range(1500):
+            con.execute("INSERT INTO records VALUES (?,?,?,?,?,?,?,?,?,NULL)",
+                        (uid(), t.workspace, target["collection_id"], f"Filler person {index:04}", "{}", 1, t.actor, now(), now()))
+    for query, status in (("Jaskeerat Saluja", "resolved"), ("jaskeerat sluja", "needs_clarification"),
+                          (target["id"], "resolved"), ("Absent Name", "no_match")):
+        r = w.resolve_record(query, target["collection_id"])
+        assert (r["status"], r["complete"]) == (status, True)
+        assert [c["id"] for c in r["candidates"]] == ([] if status == "no_match" else [target["id"]])
+    assert w.resolve_record("captain")["selected_record_id"] == nicknamed["id"]
+    crowded = w.resolve_record("Filler person", target["collection_id"])  # too many to review
+    assert crowded["status"] == "incomplete" and len(crowded["candidates"]) == 20
+    fresh = w.resolve_record("Entirely New", target["collection_id"])
+    created = w.commit_write(w.prepare_write("create_record", {"collection_id": target["collection_id"],
+        "title": "Entirely New", "data": {}}, [fresh["resolution_id"]], "No existing person matches")["action_id"])
+    assert created["title"] == "Entirely New"
+
+
+def test_candidate_score_shortcuts_never_change_a_qualifying_score():
+    import random
+    from tracker.workflow import CANDIDATE_THRESHOLD, candidate_score, similarity
+    rng = random.Random(11)
+    for _ in range(20000):
+        a, b = ("".join(rng.choices("abcde fg", k=rng.randint(1, 9))) for _ in range(2))
+        expected = similarity(a, b)
+        assert candidate_score(a, b) == (expected if expected >= CANDIDATE_THRESHOLD else 0)

@@ -186,3 +186,18 @@ def test_batch_stdio(setup):
             replay = await client.call_tool('commit_batch_write', {'action_id': prepared['action_id']})
             assert replay.structured_content['result'] == result
     asyncio.run(run())
+
+
+def test_batch_traverse_matches_single_call_and_shares_the_budget(setup):
+    t, b, records = setup
+    t.link_records(records[0]['id'], 'mentors', records[1]['id'])
+    request = dict(operation='traverse', start_record_id=records[0]['id'], max_depth=3, max_nodes=40)
+    out = b.read([request, dict(operation='search_records', text='abhi', limit=60)])['results']
+    assert out[0]['operation'] == 'traverse'
+    assert out[0]['result'] == t.traverse(records[0]['id'], max_depth=3, max_nodes=40)
+    assert [n['title'] for n in out[0]['result']['nodes']] == ['Abhishek'] == [r['title'] for r in out[1]['result']['records']]
+    failure('INVALID_INPUT', b.read, [request, dict(operation='search_records', limit=61)])
+    failure('INVALID_INPUT', b.read, [dict(request, max_nodes=101)])
+    failure('INVALID_INPUT', b.read, [dict(request, direction='sideways')])
+    assert failure('NOT_FOUND', b.read, [dict(operation='list_collections'),
+                                         dict(request, start_record_id='missing')]).details['item_index'] == 1

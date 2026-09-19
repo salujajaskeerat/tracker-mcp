@@ -74,9 +74,11 @@ def build_server(tracker: Tracker) -> MCPServer:
 
     @server.tool()
     def batch_read(requests: list[ReadRequest]) -> dict[str, Any]:
-        """Read 1–10 mixed searches, contexts or catalogs in one consistent snapshot.
-        Searches may include_context to return full records and one-hop links for the page.
-        Total search limits plus standalone context/catalog items must be <=100.
+        """Read 1–10 mixed searches, contexts, traversals or catalogs in one consistent snapshot.
+        Searches accept text (full-text) and may include_context to return full records and
+        one-hop links for the page. operation 'traverse' takes the traverse tool's arguments,
+        with max_nodes capped at 100 here. Total search limits plus traverse max_nodes
+        (default 50) plus standalone context/catalog items must be <=100.
         Each search retains its own next_cursor. Context event_limit defaults to 0 (omitted,
         not absent); set 1–100 for history. Relationship limits apply per direction.
         Ordered results carry item_index; any failure rejects the call. Max response 2 MB.
@@ -121,6 +123,7 @@ def build_server(tracker: Tracker) -> MCPServer:
     def resolve_record(query: str, collection_id: str | None = None,
                        context_record_ids: list[str] | None = None) -> dict[str, Any]:
         """Resolve a name, misspelling, confirmed alias or known stable ID. Includes archives.
+        Every title and alias in scope is compared, so a complete result covers the whole scope.
         Optional explicit context IDs require links to ALL of them (one hop, either direction).
         Returns evidence, candidates, completeness, status and resolution_id. Fuzzy/ambiguous
         results require clarification or independent identity evidence before writes. 'me'

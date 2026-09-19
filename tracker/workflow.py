@@ -15,8 +15,9 @@ from .service import (TrackerError, bounded, invalid, now, object_json, record,
                       summary, text, uid)
 
 COLLECTION_SCAN_LIMIT = 200
-RECORD_SCAN_LIMIT = 1000
+RECORD_SCAN_LIMIT = 100_000
 CANDIDATE_LIMIT = 20
+CANDIDATE_THRESHOLD = .65
 
 
 def normalize(value):
@@ -33,6 +34,23 @@ def similarity(query, name):
     if a in b or b in a:
         return 0.85
     return SequenceMatcher(None, a, b, autojunk=False).ratio()
+
+
+def candidate_score(query, name):
+    """similarity(), or 0 below the candidate threshold. difflib's two upper bounds reject most
+    names before the quadratic comparison, without changing any score that reaches the threshold."""
+    a, b = normalize(query), normalize(name)
+    if a == b:
+        return 1.0
+    if min(len(a), len(b)) < 3:
+        return 0.0
+    if a in b or b in a:
+        return 0.85
+    matcher = SequenceMatcher(None, a, b, autojunk=False)
+    if matcher.real_quick_ratio() < CANDIDATE_THRESHOLD or matcher.quick_ratio() < CANDIDATE_THRESHOLD:
+        return 0.0
+    ratio = matcher.ratio()
+    return ratio if ratio >= CANDIDATE_THRESHOLD else 0.0
 
 
 def words(value):
@@ -123,34 +141,50 @@ class Workflow:
                 self.t._collection(con, collection_id)
             for rid in context_record_ids:
                 self.t._record(con, rid)
-            sql = """SELECT r.*, c.name AS collection_name FROM records r
-                     JOIN collections c ON c.id=r.collection_id WHERE r.workspace_id=?"""
-            args = [self.t.workspace]
+            # Every name is scored inside SQLite by the same similarity rules, so no candidate
+            # can be missed; only the few best rows are then loaded with their context.
+            con.create_function("name_score", 2, candidate_score, deterministic=True)
+            scope, scope_args = "r.workspace_id=?", [self.t.workspace]
             if collection_id:
-                sql += " AND r.collection_id=?"
-                args.append(collection_id)
-            rows = con.execute(sql + " ORDER BY r.id LIMIT ?", [*args, RECORD_SCAN_LIMIT + 1]).fetchall()
-            candidates = []
+                scope += " AND r.collection_id=?"
+                scope_args.append(collection_id)
+            scanned = con.execute(f"SELECT count(*) FROM records r WHERE {scope}", scope_args).fetchone()[0]
+            self_alias = f"@self:{self.t.actor}"
             self_query = normalize(query) in {"me", "myself", "i"}
-            for row in rows[:RECORD_SCAN_LIMIT]:
+            if self_query:
+                names, name_args = """SELECT a.record_id, 1.0 AS score FROM record_aliases a
+                    WHERE a.workspace_id=? AND a.alias=?""", [self.t.workspace, self_alias]
+            else:
+                names = f"""SELECT record_id, max(score) AS score FROM (
+                        SELECT r.id AS record_id, name_score(?, r.title) AS score FROM
+                            (SELECT * FROM records r WHERE {scope} ORDER BY r.id LIMIT ?) r
+                        UNION ALL
+                        SELECT a.record_id, name_score(?, a.alias) FROM record_aliases a
+                            WHERE a.workspace_id=? AND a.alias NOT LIKE '@self:%'
+                        UNION ALL
+                        SELECT r.id, 2.0 FROM records r WHERE r.workspace_id=? AND r.id=?)
+                    GROUP BY record_id HAVING max(score) >= {CANDIDATE_THRESHOLD}"""
+                name_args = [query, *scope_args, RECORD_SCAN_LIMIT, query, self.t.workspace,
+                             self.t.workspace, query]
+            linked = "".join(""" AND EXISTS (SELECT 1 FROM relationships l WHERE l.workspace_id=r.workspace_id
+                AND ((l.source_id=r.id AND l.target_id=?) OR (l.target_id=r.id AND l.source_id=?)))"""
+                for _ in context_record_ids)
+            rows = con.execute(f"""SELECT r.*, c.name AS collection_name, n.score FROM ({names}) n
+                JOIN records r ON r.id=n.record_id JOIN collections c ON c.id=r.collection_id
+                WHERE {scope}{linked} ORDER BY n.score DESC, r.title, r.id LIMIT ?""",
+                [*name_args, *scope_args, *[x for rid in context_record_ids for x in (rid, rid)],
+                 CANDIDATE_LIMIT + 1]).fetchall()
+            candidates = []
+            for row in rows:
                 aliases = [r[0] for r in con.execute("SELECT alias FROM record_aliases WHERE workspace_id=? AND record_id=?",
                                                    (self.t.workspace, row["id"]))]
+                score = min(row["score"], 1.0)
                 if self_query:
-                    score = 1.0 if f"@self:{self.t.actor}" in aliases else 0.0
                     basis = "explicit self mapping for configured local actor"
+                elif row["score"] == 2:
+                    basis = "explicit stable record ID"
                 else:
-                    visible_aliases = [a for a in aliases if not a.startswith("@self:")]
-                    score = max([similarity(query, row["title"]), *[similarity(query, a) for a in visible_aliases]])
                     basis = "exact normalized title or confirmed alias" if score == 1 else "similar spelling; identity not established"
-                    if query == row["id"]:
-                        score, basis = 1.0, "explicit stable record ID"
-                if score < .65:
-                    continue
-                linked_ids = {r[0] for r in con.execute("""SELECT target_id FROM relationships WHERE workspace_id=? AND source_id=?
-                    UNION SELECT source_id FROM relationships WHERE workspace_id=? AND target_id=?""",
-                    (self.t.workspace, row["id"], self.t.workspace, row["id"]))}
-                if not set(context_record_ids) <= linked_ids:
-                    continue
                 context = self.t.get_record_context(row["id"], relationship_limit=5, event_limit=1)
                 reasons = [basis]
                 if context_record_ids:
@@ -162,7 +196,7 @@ class Workflow:
                     "incoming": context["incoming"], "outgoing": context["outgoing"],
                     "links_truncated": context["incoming_truncated"] or context["outgoing_truncated"]})
             candidates.sort(key=lambda c: (-c["similarity"], c["title"], c["id"]))
-            complete = len(rows) <= RECORD_SCAN_LIMIT and len(candidates) <= CANDIDATE_LIMIT
+            complete = scanned <= RECORD_SCAN_LIMIT and len(candidates) <= CANDIDATE_LIMIT
             exact = [c for c in candidates if c["similarity"] == 1]
             status = "no_match"
             if not complete:
